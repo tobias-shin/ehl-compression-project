@@ -727,13 +727,15 @@ def _process_transformer_xl(compress, length, vocab_size, coder, data):
     (Phase 2A runs with tgt_len=1 only — multi-target packing is Phase 2B.)
   - Online dropout is off (deterministic=True), matching the LSTM path.
 
-  Phase 2A limitations (Phase 2B will lift):
-  - Retraining (`retrain_period_schedule`) is ignored; the model is trained
-    online via the streaming loss only.
+  Online retraining honors ``retrain_period_schedule`` and runs in NNCP's
+  retrain shape (``retrain_tgt_len``, ``retrain_mem_len``) via
+  ``_retrain_transformer_xl``; ``model.reset_length`` toggles around the call.
+
+  Limitations (later work):
   - Multi-part / checkpointing not yet supported (asserts current_part == 1).
   """
   assert current_part == 1 and total_parts == 1, (
-      "transformer_xl backend currently supports only single-part runs (Phase 2A)."
+      "transformer_xl backend currently supports only single-part runs."
   )
   if checkpoint:
     print("[transformer_xl] Warning: checkpoint=True is not yet supported; ignoring.")
@@ -767,6 +769,7 @@ def _process_transformer_xl(compress, length, vocab_size, coder, data):
 
   models = []
   optimizers = []
+  retrain_optimizers = []
   initial_lr = lr_schedule[0][1] if lr_schedule else 5e-4
   for _ in range(ensemble_size):
     m = build_model('transformer_xl',
@@ -776,6 +779,11 @@ def _process_transformer_xl(compress, length, vocab_size, coder, data):
     models.append(m)
     optimizers.append(torch.optim.Adam(
         m.parameters(), lr=initial_lr, betas=(adam_b1, adam_b2), eps=adam_eps))
+    # Separate optimizer state for retraining, mirroring NNCP's saved-state
+    # toggle and torch_compress's two-optimizer pattern. lr is overwritten
+    # per-step inside the retrain function.
+    retrain_optimizers.append(torch.optim.Adam(
+        m.parameters(), lr=1.0, betas=(adam_b1, adam_b2), eps=adam_eps))
 
   total_params = sum(p.numel() for p in models[0].parameters()) * ensemble_size
   print("\\n" + "=" * 80)
@@ -806,18 +814,58 @@ def _process_transformer_xl(compress, length, vocab_size, coder, data):
   )
   mems_per_model = [m.init_states(batch_size, device) for m in models]
 
+  retrain_p_schedule = parse_schedule(retrain_period_schedule)
+  retrain_l_schedule = parse_schedule(retrain_lr_schedule)
+
   cross_entropy = 0.0
   denom = 0.0
   template = '{:0.2f}%\\tcross entropy: {:0.2f}\\ttime: {:0.2f}\\tlr: {:0.8f}\\tstep: {}'
 
   pos = 0
   current_lr = initial_lr
+  last_retrain_pos = 0
 
   while pos < end_pos:
     current_lr = get_scheduled_value(lr_schedule, pos)
     for opt in optimizers:
       for g in opt.param_groups:
         g['lr'] = current_lr
+
+    # NNCP-style retrain: reshape model to retrain_(tgt_len, mem_len), run a
+    # streaming pass over the trailing retrain_block_len chars with mems
+    # carrying within the pass, then restore the streaming shape.
+    current_retrain_period = get_scheduled_value(retrain_p_schedule, pos)
+    current_retrain_lr = get_scheduled_value(retrain_l_schedule, pos)
+    if current_retrain_period > 0 and (pos - last_retrain_pos) >= current_retrain_period:
+      retrain_start_time = time.time()
+      retrain_loss = _retrain_transformer_xl(
+          models=models,
+          retrain_optimizers=retrain_optimizers,
+          current_lr=current_retrain_lr,
+          file_data=data,
+          file_pos=pos + 1,
+          retrain_block_len=retrain_block_len,
+          retrain_tgt_len=retrain_tgt_len,
+          retrain_mem_len=retrain_mem_len,
+          retrain_batch_size=retrain_batch_size,
+          stream_mem_len=mem_len,
+          vocab_size=vocab_size,
+          device=device,
+      )
+      last_retrain_pos = pos
+      retrain_duration = time.time() - retrain_start_time
+      print(f"[transformer_xl] retrain done at step {pos}: "
+            f"loss={retrain_loss:.4f}, duration={retrain_duration:.2f}s")
+      if tb_writer is not None:
+        tb_writer.add_scalar('retrain/loss', retrain_loss, pos)
+        tb_writer.add_scalar('retrain/lr', current_retrain_lr, pos)
+        tb_writer.add_scalar('retrain/duration_sec', retrain_duration, pos)
+      # Mems were attached to the pre-retrain stream-shape model; the retrain
+      # mutated weights and toggled reset_length back to streaming, but the
+      # mems still reflect activations from before the weight update. Reset
+      # them to empty so the next forward pass re-builds context with the
+      # updated weights.
+      mems_per_model = [m.init_states(batch_size, device) for m in models]
 
     # Forward — autograd ON, dropout off (matches LSTM forward_ensemble path).
     log_probs_list = []
@@ -879,6 +927,95 @@ def _process_transformer_xl(compress, length, vocab_size, coder, data):
     ))
     tb_writer.flush()
     tb_writer.close()
+
+
+def _retrain_transformer_xl(*, models, retrain_optimizers, current_lr, file_data,
+                            file_pos, retrain_block_len, retrain_tgt_len,
+                            retrain_mem_len, retrain_batch_size, stream_mem_len,
+                            vocab_size, device):
+  """NNCP-style retraining pass on the trailing ``retrain_block_len`` chars.
+
+  Mirrors NNCP v2's ``retrain()`` from ``nncp.py``:
+
+  - ``model.reset_length(retrain_tgt_len, 0, retrain_mem_len)`` reshapes the
+    model for retrain (typically tgt_len=64, mem_len=128 for NNCP-base).
+  - The retrain window is split into ``retrain_batch_size`` parallel streams,
+    each ``block_stride = block_len // retrain_batch_size`` chars long.
+  - Steps process ``retrain_tgt_len`` tokens at a time; mems carry forward
+    *within* the retrain pass (this is the part that distinguishes NNCP-style
+    retrain from the LSTM-style fresh-state-per-batch retrain).
+  - Dropout is on (``deterministic=False`` -> ``model.train()`` inside the
+    adapter); the model's dropout rate was set at construction via the
+    ``dropout`` notebook hparam.
+  - On the very first step, the input row is dummied (matches NNCP exactly --
+    avoids the off-by-one negative index at stream_pos=0).
+  - At exit, ``model.reset_length(1, 0, stream_mem_len)`` restores the
+    streaming-inference shape so the caller's ``mems_per_model`` rebuild
+    (which the caller does immediately after) produces correctly-sized mems.
+
+  Returns the mean per-step cross-entropy loss across the ensemble (in nats).
+  """
+  block_len = min(file_pos, retrain_block_len)
+  if block_len < retrain_batch_size * retrain_tgt_len:
+    return 0.0  # not enough trailing data for a single retrain step
+  block_start = file_pos - block_len
+  block_stride = block_len // retrain_batch_size
+  if block_stride < retrain_tgt_len:
+    return 0.0
+
+  # Switch every ensemble member to retrain shape before the first forward.
+  for model in models:
+    model.reset_length(retrain_tgt_len, 0, retrain_mem_len)
+
+  ensemble_losses = []
+  try:
+    for model, optimizer in zip(models, retrain_optimizers):
+      mems = model.init_states(retrain_batch_size, device)
+      stream_pos = 0
+      step_losses = []
+      while (stream_pos + retrain_tgt_len) <= block_stride:
+        data0 = []
+        target0 = []
+        for j in range(retrain_tgt_len):
+          target_pos = block_start + stream_pos + j
+          target_row = file_data[target_pos: target_pos + block_stride * retrain_batch_size: block_stride]
+          target0.append(target_row)
+          if stream_pos == 0:
+            data_row = [0] * retrain_batch_size  # dummy first step (matches NNCP)
+          else:
+            input_pos = target_pos - 1
+            data_row = file_data[input_pos: input_pos + block_stride * retrain_batch_size: block_stride]
+          data0.append(data_row)
+
+        # Build (retrain_tgt_len, retrain_batch_size) tensors then transpose
+        # to (batch, tgt_len) to match the adapter's batch-first interface.
+        data_t = torch.tensor(data0, dtype=torch.long, device=device).t().contiguous()
+        target_t = torch.tensor(target0, dtype=torch.long, device=device).t().contiguous()
+
+        optimizer.zero_grad()
+        # return_sequence=True -> logits at every position; deterministic=False
+        # -> dropout on (model.train() set by the adapter).
+        logits, mems = model(data_t, mems, return_sequence=True, deterministic=False)
+        loss = F.cross_entropy(
+            logits.reshape(-1, vocab_size),
+            target_t.reshape(-1),
+            reduction='mean',
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 4.0)
+        for g in optimizer.param_groups:
+          g['lr'] = current_lr
+        optimizer.step()
+        step_losses.append(loss.item())
+        stream_pos += retrain_tgt_len
+
+      ensemble_losses.append(float(np.mean(step_losses)) if step_losses else 0.0)
+  finally:
+    # Always restore the streaming shape, even on exception.
+    for model in models:
+      model.reset_length(1, 0, stream_mem_len)
+
+  return float(np.mean(ensemble_losses)) if ensemble_losses else 0.0
 '''
 
 
@@ -935,9 +1072,12 @@ ext_tgt_len = 31 #@param {type:"integer"}
 attn_type = 1 #@param {type:"integer"}
 tied_r_bias = True #@param {type:"boolean"}
 use_gelu = True #@param {type:"boolean"}
-dropout = 0.0 #@param {type:"number"}
+dropout = 0.25 #@param {type:"number"}
 dropatt = 0.0 #@param {type:"number"}
 init_std = 0.02 #@param {type:"number"}
+retrain_tgt_len = 64 #@param {type:"integer"}
+retrain_mem_len = 128 #@param {type:"integer"}
+#@markdown _The model is constructed with `dropout`, but streaming forward passes use `deterministic=True` (eval mode, dropout off). Dropout activates only during retraining (`deterministic=False`, train mode). `retrain_tgt_len` and `retrain_mem_len` are NNCP's retrain-time shape — `model.reset_length()` swaps these in around each retrain pass and restores the streaming shape (1, 0, mem_len) afterward._
 '''
 params_src = ''.join(nb['cells'][3]['source']) + PARAMS_TB_APPEND
 nb['cells'][3] = code_cell(params_src, tags=["parameters"])
