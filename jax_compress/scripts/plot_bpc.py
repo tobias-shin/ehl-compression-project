@@ -14,13 +14,16 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 # torch_compress LSTM sweep -- (size_bytes, bpc, label, precision, preprocess)
+# NOTE: every LSTM run is fp32 in practice -- the use_bf16 notebook parameter
+# was advertised but never wired into any code path on the LSTM side, so the
+# previously-labelled "bf16" rows were actually running fp32. The two enwik7
+# rows (1.6174, 1.6159) reflect two separate fp32 runs with slightly
+# different bpc due to seed / run-time variance.
 DATA = [
     (    10_000, 3.6688, 'enwik4', 'fp32', 'none'),
-    (   100_000, 2.6665, 'enwik5', 'bf16', 'nncp'),
     (   100_000, 2.6665, 'enwik5', 'fp32', 'nncp'),
-    ( 1_000_000, 1.9992, 'enwik6', 'bf16', 'nncp'),
     ( 1_000_000, 1.9992, 'enwik6', 'fp32', 'nncp'),
-    (10_000_000, 1.6174, 'enwik7', 'bf16', 'nncp'),
+    (10_000_000, 1.6174, 'enwik7', 'fp32', 'nncp'),  # was mislabeled "bf16"
     (10_000_000, 1.6159, 'enwik7', 'fp32', 'nncp'),
     (100_000_000, 1.2918, 'enwik8', 'fp32', 'nncp'),
 ]
@@ -63,13 +66,16 @@ def main():
 
     if fp32_pts:
         xs, ys, ls = zip(*fp32_pts)
-        ax.plot(xs, ys, 'o-', color='#1f77b4', label='torch (fp32)', markersize=8)
+        ax.plot(xs, ys, 'o-', color='#1f77b4', label='torch LSTM (fp32)', markersize=8)
         for x, y, l in fp32_pts:
             ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, 6), fontsize=9)
 
     if bf16_pts:
+        # Currently empty -- LSTM was never actually run in bf16 (use_bf16 was
+        # a no-op on that path). Kept for forward compatibility if/when the
+        # LSTM path gets real mixed-precision support.
         xs, ys, ls = zip(*bf16_pts)
-        ax.plot(xs, ys, 's-', color='#ff7f0e', label='torch (bf16)', markersize=8)
+        ax.plot(xs, ys, 's-', color='#ff7f0e', label='torch LSTM (bf16)', markersize=8)
         for x, y, l in bf16_pts:
             ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, 6), fontsize=9)
 
