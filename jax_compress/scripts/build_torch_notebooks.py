@@ -766,8 +766,19 @@ def _process_transformer_xl(compress, length, vocab_size, coder, data):
   if checkpoint:
     print("[transformer_xl] Warning: checkpoint=True is not yet supported; ignoring.")
 
-  use_bf16_flag = bool(globals().get('use_bf16', False))
-  ac_dtype = torch.bfloat16 if use_bf16_flag else torch.float32
+  # NOTE: bf16 was wired up here but produced a non-deterministic retrain pass
+  # (autocast + use_deterministic_algorithms(True) silently selected a non-
+  # deterministic bf16 kernel; encode and decode disagreed on probabilities,
+  # so enwik6+ bytes did not round-trip even though enwik4/5 -- which never
+  # fire retrain meaningfully -- happened to round-trip OK). Pinning to fp32
+  # until this is properly debugged. Streaming-only bf16 was also slower than
+  # fp32 at the file sizes where retrain stays a no-op, so a streaming-only
+  # partial fix would not produce a meaningful speedup.
+  if bool(globals().get('use_bf16', False)):
+    print("[transformer_xl] use_bf16=True ignored: bf16 currently breaks "
+          "round-trip during retrain. Forcing fp32.")
+  use_bf16_flag = False
+  ac_dtype = torch.float32
 
   start = time.time()
   last_print_time = start
@@ -1027,8 +1038,11 @@ def _retrain_transformer_xl(*, models, retrain_optimizers, current_lr, file_data
   for model in models:
     model.reset_length(retrain_tgt_len, 0, retrain_mem_len)
 
-  use_bf16_flag = bool(globals().get('use_bf16', False))
-  ac_dtype = torch.bfloat16 if use_bf16_flag else torch.float32
+  # bf16 was found to break round-trip in this retrain pass (see longer note
+  # at the equivalent point in _process_transformer_xl). Forcing fp32 here
+  # too until that's fixed.
+  use_bf16_flag = False
+  ac_dtype = torch.float32
 
   ensemble_losses = []
   try:
