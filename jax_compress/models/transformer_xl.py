@@ -51,6 +51,7 @@ class TransformerXLModel(nn.Module):
         same_length: bool = False,
         clamp_len: int = -1,
         d_embed: int | None = None,
+        init_std: float = 0.02,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -79,6 +80,16 @@ class TransformerXLModel(nn.Module):
             tied_r_bias=tied_r_bias,
             use_gelu=use_gelu,
         )
+        # NNCP allocates relative-position params via torch.Tensor() (uninitialised
+        # memory) and relies on an external weights_init pass. Without it the model
+        # produces garbage — e.g. the smoke test in this file caught a near-zero
+        # collapse caused by leaving these untouched. PyTorch defaults handle the
+        # nn.Linear / nn.LayerNorm / nn.Embedding modules; we only need to fill the
+        # bare Parameters here.
+        with torch.no_grad():
+            for attr in ("r_emb", "r_w_bias", "r_bias", "r_r_bias"):
+                if hasattr(self.lm, attr):
+                    nn.init.normal_(getattr(self.lm, attr), mean=0.0, std=init_std)
 
     def init_states(self, batch_size: int, device):
         del batch_size  # mems are sequence-indexed, not batch-indexed
@@ -148,14 +159,6 @@ def _smoke_test():
         tied_r_bias=True,
         use_gelu=True,
     )
-    # MemTransformerLM allocates its relative-position params with torch.Tensor(),
-    # which leaves them uninitialised — NNCP's training script fills them via a
-    # weights_init pass. The smoke test mirrors that subset; everything else
-    # (nn.Linear, nn.LayerNorm, nn.Embedding) is fine on PyTorch defaults.
-    with torch.no_grad():
-        for attr in ("r_emb", "r_w_bias", "r_bias", "r_r_bias"):
-            if hasattr(model.lm, attr):
-                torch.nn.init.normal_(getattr(model.lm, attr), mean=0.0, std=0.02)
 
     device = torch.device("cpu")
     inputs = torch.randint(0, vocab_size, (batch_size, seq_length), device=device)

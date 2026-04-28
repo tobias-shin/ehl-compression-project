@@ -198,9 +198,11 @@ def build_model(model_type, *, vocab_size, embedding_size, rnn_units, num_layers
   the local NNCP-style adapter; it is unavailable in a vanilla Colab session
   that has not cloned this repo.
 
-  Transformer hparams are not yet plumbed through this factory -- "transformer_xl"
-  uses the adapter's defaults (NNCP-base shape, but with the run loop still in
-  LSTM mode). Phase 2 will expose the right hparams and reshape the loop.
+  Transformer hparams are read from notebook globals (``n_layer``, ``n_head``,
+  ``d_model``, ``d_head``, ``d_inner``, ``mem_len``, ``ext_tgt_len``,
+  ``attn_type``, ``tied_r_bias``, ``use_gelu``, ``dropout``, ``dropatt``,
+  ``init_std``) so the LSTM call sites do not need to change. Missing globals
+  fall back to the adapter's NNCP-base defaults.
   """
   if model_type == "lstm":
     return LSTMModel(vocab_size=vocab_size, embedding_size=embedding_size,
@@ -208,7 +210,24 @@ def build_model(model_type, *, vocab_size, embedding_size, rnn_units, num_layers
                      dropout_rate=dropout_rate)
   if model_type == "transformer_xl":
     from models.transformer_xl import TransformerXLModel
-    return TransformerXLModel(vocab_size=vocab_size)
+    g = globals()
+    return TransformerXLModel(
+        vocab_size=vocab_size,
+        n_layer=g.get('n_layer', 12),
+        n_head=g.get('n_head', 8),
+        d_model=g.get('d_model', 512),
+        d_head=g.get('d_head', 64),
+        d_inner=g.get('d_inner', 2048),
+        dropout=g.get('dropout', 0.0),
+        dropatt=g.get('dropatt', 0.0),
+        tgt_len=1,  # streaming inference shape; reset_length toggles for retrain
+        ext_len=g.get('ext_tgt_len', 31),
+        mem_len=g.get('mem_len', 160),
+        attn_type=g.get('attn_type', 1),
+        tied_r_bias=g.get('tied_r_bias', True),
+        use_gelu=g.get('use_gelu', True),
+        init_std=g.get('init_std', 0.02),
+    )
   raise ValueError(f"unknown model_type: {model_type!r}")
 '''
 
@@ -365,7 +384,12 @@ def process(compress, length, vocab_size, coder, data):
 
   Streams characters through the LSTM ensemble, periodically retrains on recent
   history, and drives the arithmetic coder one symbol at a time.
+
+  When ``model_type == "transformer_xl"``, dispatches to the NNCP-style
+  streaming loop in ``_process_transformer_xl`` instead.
   """
+  if globals().get('model_type', 'lstm') == 'transformer_xl':
+    return _process_transformer_xl(compress, length, vocab_size, coder, data)
   start = time.time()
   last_print_time = start
   reset_seed()
@@ -692,6 +716,169 @@ def process(compress, length, vocab_size, coder, data):
     ))
     tb_writer.flush()
     tb_writer.close()
+
+
+def _process_transformer_xl(compress, length, vocab_size, coder, data):
+  """Transformer-XL streaming compress/decompress, modeled on NNCP v2's train().
+
+  Differences from the LSTM path:
+  - Mems carry forward naturally between steps; there is no state queue / BPTT.
+  - Each step feeds (ext_tgt_len + 1) tokens and predicts the last token.
+    (Phase 2A runs with tgt_len=1 only — multi-target packing is Phase 2B.)
+  - Online dropout is off (deterministic=True), matching the LSTM path.
+
+  Phase 2A limitations (Phase 2B will lift):
+  - Retraining (`retrain_period_schedule`) is ignored; the model is trained
+    online via the streaming loss only.
+  - Multi-part / checkpointing not yet supported (asserts current_part == 1).
+  """
+  assert current_part == 1 and total_parts == 1, (
+      "transformer_xl backend currently supports only single-part runs (Phase 2A)."
+  )
+  if checkpoint:
+    print("[transformer_xl] Warning: checkpoint=True is not yet supported; ignoring.")
+
+  start = time.time()
+  last_print_time = start
+  reset_seed()
+  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+  tb_writer = None
+  if globals().get('tensorboard', False):
+    from torch.utils.tensorboard import SummaryWriter
+    _tb_logdir = globals().get('tensorboard_logdir', 'data/tensorboard')
+    _tb_run = globals().get('tensorboard_run_name', 'torch_compress')
+    tb_writer = SummaryWriter(log_dir=os.path.join(_tb_logdir, _tb_run))
+    tb_writer.add_text('config', (
+        f"backend=torch model=transformer_xl device={device} "
+        f"batch_size={batch_size} ext_tgt_len={ext_tgt_len} mem_len={mem_len} "
+        f"n_layer={n_layer} d_model={d_model} n_head={n_head} d_head={d_head} "
+        f"d_inner={d_inner} ensemble_size={ensemble_size}"
+    ))
+    print(f"[tensorboard] writing to {tb_writer.log_dir}")
+
+  lr_schedule = parse_schedule(learning_rate_schedule)
+
+  print(f"[transformer_xl] batch_size={batch_size}, ext_tgt_len={ext_tgt_len}, "
+        f"mem_len={mem_len}, n_layer={n_layer}, d_model={d_model}, n_head={n_head}, "
+        f"d_head={d_head}, d_inner={d_inner}, ensemble_size={ensemble_size}, "
+        f"learning_rate_schedule={learning_rate_schedule}, "
+        f"adam_b1={adam_b1}, adam_b2={adam_b2}, adam_eps={adam_eps}")
+
+  models = []
+  optimizers = []
+  initial_lr = lr_schedule[0][1] if lr_schedule else 5e-4
+  for _ in range(ensemble_size):
+    m = build_model('transformer_xl',
+                    vocab_size=vocab_size, embedding_size=embedding_size,
+                    rnn_units=rnn_units, num_layers=num_layers,
+                    dropout_rate=0.0).to(device)
+    models.append(m)
+    optimizers.append(torch.optim.Adam(
+        m.parameters(), lr=initial_lr, betas=(adam_b1, adam_b2), eps=adam_eps))
+
+  total_params = sum(p.numel() for p in models[0].parameters()) * ensemble_size
+  print("\\n" + "=" * 80)
+  print(f"Transformer-XL Architecture (Ensemble Size: {ensemble_size})")
+  print("=" * 80)
+  print(models[0])
+  print(f"\\nTotal Ensemble Parameters: {total_params:,}")
+  print("=" * 80 + "\\n")
+
+  split = math.ceil(length / batch_size)
+  end_pos = split
+  print(f"Processing single part. Stream length per batch: {split}")
+
+  # Uniform prior used to AC-code the very first symbol of each parallel stream.
+  freq = np.cumsum(np.full(vocab_size, (1.0 / vocab_size)) * 10000000 + 1)
+
+  qlen = ext_tgt_len + 1  # tgt_len = 1 for streaming inference
+
+  initial_symbols = []
+  for i in range(batch_size):
+    initial_symbols.append(get_symbol(i * split, length, freq, coder, compress, data))
+  # Bootstrap input window: the just-coded symbol replicated qlen times.
+  # Real context accumulates as the stream advances.
+  seq_input = (
+      torch.tensor(initial_symbols, dtype=torch.long, device=device)
+      .unsqueeze(1)
+      .repeat(1, qlen)
+  )
+  mems_per_model = [m.init_states(batch_size, device) for m in models]
+
+  cross_entropy = 0.0
+  denom = 0.0
+  template = '{:0.2f}%\\tcross entropy: {:0.2f}\\ttime: {:0.2f}\\tlr: {:0.8f}\\tstep: {}'
+
+  pos = 0
+  current_lr = initial_lr
+
+  while pos < end_pos:
+    current_lr = get_scheduled_value(lr_schedule, pos)
+    for opt in optimizers:
+      for g in opt.param_groups:
+        g['lr'] = current_lr
+
+    # Forward — autograd ON, dropout off (matches LSTM forward_ensemble path).
+    log_probs_list = []
+    logits_list = []
+    new_mems_list = []
+    for model, mems in zip(models, mems_per_model):
+      logits, new_mems = model(seq_input, mems, return_sequence=False, deterministic=True)
+      logits_list.append(logits)
+      log_probs_list.append(F.log_softmax(logits, dim=-1))
+      new_mems_list.append(new_mems)
+    mean_log_probs = torch.stack(log_probs_list, dim=0).mean(dim=0)
+    probs = F.softmax(mean_log_probs, dim=-1).detach().cpu().numpy()
+
+    # Drive the arithmetic coder: one symbol per parallel stream.
+    current_symbols = []
+    current_mask = []
+    for i in range(batch_size):
+      freq_i = np.cumsum(probs[i] * 10000000 + 1)
+      index = pos + 1 + i * split
+      symbol = get_symbol(index, length, freq_i, coder, compress, data)
+      current_symbols.append(symbol)
+      current_mask.append(1.0 if index < length else 0.0)
+
+    symbols_t = torch.tensor(current_symbols, dtype=torch.long, device=device)
+    mask_t = torch.tensor(current_mask, dtype=torch.float32, device=device)
+
+    # Reuse the LSTM-side helper — same per-step loss/clip/step shape.
+    loss_val, loss_denom = backward_and_step(
+        logits_list, optimizers, models, symbols_t, mask_t, vocab_size)
+    cross_entropy += loss_val
+    denom += loss_denom
+
+    # Carry mems forward (already detached inside MemTransformerLM._update_mems).
+    mems_per_model = new_mems_list
+    # Slide window: drop oldest, append the symbol just coded.
+    seq_input = torch.cat([seq_input[:, 1:], symbols_t.unsqueeze(1)], dim=1)
+    pos += 1
+
+    if time.time() - last_print_time >= 20:
+      last_print_time = time.time()
+      time_diff = last_print_time - start
+      current_bpc = (cross_entropy / denom) / np.log(2)
+      print(template.format(pos / split * 100, current_bpc, time_diff, current_lr, pos))
+      if tb_writer is not None:
+        tb_writer.add_scalar('train/bpc', current_bpc, pos)
+        tb_writer.add_scalar('train/cross_entropy_total', cross_entropy, pos)
+        tb_writer.add_scalar('train/lr', current_lr, pos)
+        tb_writer.add_scalar('train/elapsed_sec', time_diff, pos)
+        tb_writer.add_scalar('train/steps_per_sec', pos / time_diff if time_diff > 0 else 0.0, pos)
+
+  if tb_writer is not None:
+    final_time = time.time() - start
+    if denom > 0:
+      tb_writer.add_scalar('train/bpc', (cross_entropy / denom) / np.log(2), pos)
+    tb_writer.add_scalar('train/elapsed_sec', final_time, pos)
+    tb_writer.add_text('summary', (
+        f"final_pos={pos} elapsed_sec={final_time:.2f} "
+        f"final_bpc={(cross_entropy / denom) / np.log(2) if denom > 0 else float('nan'):.4f}"
+    ))
+    tb_writer.flush()
+    tb_writer.close()
 '''
 
 
@@ -734,6 +921,23 @@ use_bf16 = True #@param {type:"boolean"}
 #@markdown ---
 model_type = "lstm" #@param ["lstm", "transformer_xl"]
 #@markdown _Predictor architecture. "lstm" is the default reference model. "transformer_xl" routes through the NNCP-style adapter (`models.transformer_xl.TransformerXLModel`) and requires the local repo (the `models/` package must be importable -- not available in a vanilla Colab clone-less session)._
+
+#@markdown ---
+#@markdown ### Transformer-XL hparams
+#@markdown _Only consulted when `model_type == "transformer_xl"`. Defaults track NNCP v2's `nncp_enwik_base.sh` config._
+n_layer = 12 #@param {type:"integer"}
+n_head = 8 #@param {type:"integer"}
+d_model = 512 #@param {type:"integer"}
+d_head = 64 #@param {type:"integer"}
+d_inner = 2048 #@param {type:"integer"}
+mem_len = 160 #@param {type:"integer"}
+ext_tgt_len = 31 #@param {type:"integer"}
+attn_type = 1 #@param {type:"integer"}
+tied_r_bias = True #@param {type:"boolean"}
+use_gelu = True #@param {type:"boolean"}
+dropout = 0.0 #@param {type:"number"}
+dropatt = 0.0 #@param {type:"number"}
+init_std = 0.02 #@param {type:"number"}
 '''
 params_src = ''.join(nb['cells'][3]['source']) + PARAMS_TB_APPEND
 nb['cells'][3] = code_cell(params_src, tags=["parameters"])
