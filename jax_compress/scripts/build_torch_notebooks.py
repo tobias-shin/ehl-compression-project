@@ -759,12 +759,16 @@ def _process_transformer_xl(compress, length, vocab_size, coder, data):
     ))
     print(f"[tensorboard] writing to {tb_writer.log_dir}")
 
-  lr_schedule = parse_schedule(learning_rate_schedule)
+  # Transformer-XL uses its own LR schedules (NNCP-base defaults). The LSTM-
+  # tuned `learning_rate_schedule` / `retrain_lr_schedule` stay reserved for
+  # the LSTM path -- transformers want lower LRs and a different decay shape.
+  lr_schedule_str = globals().get('learning_rate_schedule_xl', learning_rate_schedule)
+  lr_schedule = parse_schedule(lr_schedule_str)
 
   print(f"[transformer_xl] batch_size={batch_size}, ext_tgt_len={ext_tgt_len}, "
         f"mem_len={mem_len}, n_layer={n_layer}, d_model={d_model}, n_head={n_head}, "
         f"d_head={d_head}, d_inner={d_inner}, ensemble_size={ensemble_size}, "
-        f"learning_rate_schedule={learning_rate_schedule}, "
+        f"learning_rate_schedule_xl={lr_schedule_str}, "
         f"adam_b1={adam_b1}, adam_b2={adam_b2}, adam_eps={adam_eps}")
 
   models = []
@@ -815,7 +819,8 @@ def _process_transformer_xl(compress, length, vocab_size, coder, data):
   mems_per_model = [m.init_states(batch_size, device) for m in models]
 
   retrain_p_schedule = parse_schedule(retrain_period_schedule)
-  retrain_l_schedule = parse_schedule(retrain_lr_schedule)
+  retrain_l_schedule_str = globals().get('retrain_lr_schedule_xl', retrain_lr_schedule)
+  retrain_l_schedule = parse_schedule(retrain_l_schedule_str)
 
   cross_entropy = 0.0
   denom = 0.0
@@ -1074,10 +1079,15 @@ tied_r_bias = True #@param {type:"boolean"}
 use_gelu = True #@param {type:"boolean"}
 dropout = 0.25 #@param {type:"number"}
 dropatt = 0.0 #@param {type:"number"}
-init_std = 0.02 #@param {type:"number"}
+init_std = 0.013 #@param {type:"number"}
 retrain_tgt_len = 64 #@param {type:"integer"}
 retrain_mem_len = 128 #@param {type:"integer"}
 #@markdown _The model is constructed with `dropout`, but streaming forward passes use `deterministic=True` (eval mode, dropout off). Dropout activates only during retraining (`deterministic=False`, train mode). `retrain_tgt_len` and `retrain_mem_len` are NNCP's retrain-time shape — `model.reset_length()` swaps these in around each retrain pass and restores the streaming shape (1, 0, mem_len) afterward._
+
+#@markdown ---
+#@markdown _Transformer-XL learning-rate schedules. The streaming and retraining LRs default to NNCP-base's values (`nncp_enwik_base.sh`). When `model_type == "transformer_xl"`, `_process_transformer_xl` reads these schedules instead of `learning_rate_schedule` / `retrain_lr_schedule` (which stay tuned for the LSTM)._
+learning_rate_schedule_xl = "0:7.9e-5 341105:1.6e-5 3134681:5.0e-6" #@param {type:"string"}
+retrain_lr_schedule_xl = "0:4.0e-4 13000:2.0e-4 93000:1.0e-4 163000:5.0e-5 1911300:1.6e-5" #@param {type:"string"}
 '''
 params_src = ''.join(nb['cells'][3]['source']) + PARAMS_TB_APPEND
 nb['cells'][3] = code_cell(params_src, tags=["parameters"])

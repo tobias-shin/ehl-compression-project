@@ -30,6 +30,47 @@ import torch.nn as nn
 from .mem_transformer import MemTransformerLM
 
 
+def _apply_nncp_weights_init(lm: "MemTransformerLM", init_std: float) -> None:
+    """Mirror NNCP's ``weights_init`` from ``nncp.py:176-201``.
+
+    The defaults PyTorch ships for ``nn.Linear`` (kaiming_uniform), ``nn.Embedding``
+    (N(0, 1)), and ``nn.LayerNorm`` (weight=1, bias=0) are wider than what NNCP
+    used to converge the 12-layer transformer on enwik8/9. NNCP's pattern is:
+
+    - Linear / Embedding weights: N(0, init_std=0.013)
+    - Linear / LayerNorm biases: 0
+    - LayerNorm weights: N(1.0, init_std)  -- not constant 1
+    - The bare relative-position parameters that ``MemTransformerLM`` allocates
+      with ``torch.Tensor(...)`` (uninitialised memory): ``r_emb``, ``r_w_bias``,
+      ``r_bias``, ``r_r_bias`` -- N(0, init_std)
+
+    Without this call the bare parameters in particular are uninitialised; an
+    earlier smoke-test version that only zeroed every 1-D parameter collapsed
+    every layer's output to zero by overwriting LayerNorm.weight.
+    """
+    with torch.no_grad():
+        for m in lm.modules():
+            cn = m.__class__.__name__
+            if "Linear" in cn:
+                if hasattr(m, "weight") and m.weight is not None:
+                    nn.init.normal_(m.weight, mean=0.0, std=init_std)
+                if hasattr(m, "bias") and m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif "Embedding" in cn:
+                if hasattr(m, "weight") and m.weight is not None:
+                    nn.init.normal_(m.weight, mean=0.0, std=init_std)
+            elif "LayerNorm" in cn:
+                if hasattr(m, "weight") and m.weight is not None:
+                    nn.init.normal_(m.weight, mean=1.0, std=init_std)
+                if hasattr(m, "bias") and m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        # The bare-Parameter relative-position weights live directly on
+        # MemTransformerLM, not inside any submodule -- handle them explicitly.
+        for attr in ("r_emb", "r_w_bias", "r_bias", "r_r_bias"):
+            if hasattr(lm, attr):
+                nn.init.normal_(getattr(lm, attr), mean=0.0, std=init_std)
+
+
 class TransformerXLModel(nn.Module):
     def __init__(
         self,
@@ -80,16 +121,7 @@ class TransformerXLModel(nn.Module):
             tied_r_bias=tied_r_bias,
             use_gelu=use_gelu,
         )
-        # NNCP allocates relative-position params via torch.Tensor() (uninitialised
-        # memory) and relies on an external weights_init pass. Without it the model
-        # produces garbage — e.g. the smoke test in this file caught a near-zero
-        # collapse caused by leaving these untouched. PyTorch defaults handle the
-        # nn.Linear / nn.LayerNorm / nn.Embedding modules; we only need to fill the
-        # bare Parameters here.
-        with torch.no_grad():
-            for attr in ("r_emb", "r_w_bias", "r_bias", "r_r_bias"):
-                if hasattr(self.lm, attr):
-                    nn.init.normal_(getattr(self.lm, attr), mean=0.0, std=init_std)
+        _apply_nncp_weights_init(self.lm, init_std)
 
     def init_states(self, batch_size: int, device):
         del batch_size  # mems are sequence-indexed, not batch-indexed
