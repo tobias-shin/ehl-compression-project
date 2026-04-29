@@ -92,6 +92,27 @@ def main():
                     default="0:7.9e-5 341105:1.6e-5 3134681:5.0e-6")
     ap.add_argument("--xl-retrain-lr-schedule",
                     default="0:4.0e-4 13000:2.0e-4 93000:1.0e-4 163000:5.0e-5 1911300:1.6e-5")
+    # ---- Data-pipeline hparams (override notebook defaults) -------------
+    # These are the LSTM-tuned defaults baked into the notebook params cell.
+    # NNCP's nncp_enwik_base.sh uses very different values for enwik8/9 --
+    # exposing them here so transformer runs can match NNCP without editing
+    # the notebook.
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help="parallel streams. Notebook default 128 (LSTM-tuned). "
+                         "NNCP-base for enwik8 uses 64.")
+    ap.add_argument("--n-words", type=int, default=None,
+                    help="NNCP preprocess vocab. Notebook default 8192. "
+                         "NNCP-base for enwik8 uses 16384.")
+    ap.add_argument("--retrain-block-len", type=int, default=None,
+                    help="trailing chars used per retrain. Notebook default "
+                         "100000. NNCP-base uses 10000000 (10M).")
+    ap.add_argument("--retrain-batch-size", type=int, default=None,
+                    help="batch dim during retrain. Notebook default 256. "
+                         "NNCP-base uses 32.")
+    ap.add_argument("--retrain-period-schedule", default=None,
+                    help='step-units schedule for retrain period. Notebook '
+                         'default "0:1001 200000:5001". NNCP-base equivalent '
+                         'with batch_size=64: "0:7813".')
     args = ap.parse_args()
 
     prepared = args.output_nb + ".prepared.ipynb"
@@ -133,6 +154,14 @@ def main():
         "learning_rate_schedule_xl": args.xl_lr_schedule,
         "retrain_lr_schedule_xl": args.xl_retrain_lr_schedule,
     }
+    # Data-pipeline hparams: only inject when explicitly set, so the notebook
+    # default applies otherwise. Avoids silently changing behaviour for
+    # existing run scripts that don't pass these new flags.
+    if args.batch_size is not None: params["batch_size"] = args.batch_size
+    if args.n_words is not None: params["n_words"] = args.n_words
+    if args.retrain_block_len is not None: params["retrain_block_len"] = args.retrain_block_len
+    if args.retrain_batch_size is not None: params["retrain_batch_size"] = args.retrain_batch_size
+    if args.retrain_period_schedule is not None: params["retrain_period_schedule"] = args.retrain_period_schedule
 
     print(f"[run_papermill] input={args.input} use_bf16={args.use_bf16} preprocess={args.preprocess}")
     print(f"[run_papermill] tb_run_name={args.tb_run_name}")
