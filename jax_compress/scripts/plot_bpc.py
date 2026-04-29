@@ -68,41 +68,40 @@ NNCP_REF = [
     (1_000_000_000, 0.9943, 'nncp-base enwik9'),  # ~0.99 bpc base config
 ]
 
+# Hybrid backend (model_type=hybrid -- LSTM + Transformer-XL geometric-mean
+# ensemble; both submodels train independently per step, AC sees the combined
+# distribution). Filled in as runs complete.
+HYBRID_DATA = [
+    (    10_000, 3.8000, 'enwik4', 'fp32', 'none'),
+    (   100_000, 2.8269, 'enwik5', 'fp32', 'nncp'),
+    # ( 1_000_000, ?, 'enwik6', 'fp32', 'nncp'),
+    # (10_000_000, ?, 'enwik7', 'fp32', 'nncp'),
+    # (100_000_000, ?, 'enwik8', 'bf16', 'nncp'),
+]
+
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_PATH = os.path.normpath(os.path.join(THIS_DIR, '..', 'data', 'bpc_vs_size.png'))
 
 
-def main():
-    fig, ax = plt.subplots(figsize=(8, 5.5))
+def _dedup_pts(rows):
+    """Collapse duplicate sizes: latest entry wins."""
+    seen = {}
+    for s, b, l, p, _ in rows:
+        seen[s] = (s, b, l)
+    return [seen[s] for s in sorted(seen)]
 
-    # Torch sweep points, color-coded by precision
+
+def _plot_lstm(ax):
     fp32_pts = [(s, b, l) for (s, b, l, p, _) in DATA if p == 'fp32']
-    bf16_pts = [(s, b, l) for (s, b, l, p, _) in DATA if p == 'bf16']
-
     if fp32_pts:
         xs, ys, ls = zip(*fp32_pts)
         ax.plot(xs, ys, 'o-', color='#1f77b4', label='torch LSTM (fp32)', markersize=8)
         for x, y, l in fp32_pts:
             ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, 6), fontsize=9)
 
-    if bf16_pts:
-        # Currently empty -- LSTM was never actually run in bf16 (use_bf16 was
-        # a no-op on that path). Kept for forward compatibility if/when the
-        # LSTM path gets real mixed-precision support.
-        xs, ys, ls = zip(*bf16_pts)
-        ax.plot(xs, ys, 's-', color='#ff7f0e', label='torch LSTM (bf16)', markersize=8)
-        for x, y, l in bf16_pts:
-            ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, 6), fontsize=9)
 
-    # Transformer-XL backend (collapsing duplicate sizes; latest entry wins
-    # so the user can append a refined fp16/bf16 run without removing the
-    # earlier fp32 row).
-    xl_pts = []
-    seen = {}
-    for s, b, l, p, _ in XL_DATA:
-        seen[s] = (s, b, l)
-    for s in sorted(seen):
-        xl_pts.append(seen[s])
+def _plot_transformer_xl(ax):
+    xl_pts = _dedup_pts(XL_DATA)
     if xl_pts:
         xs, ys, ls = zip(*xl_pts)
         ax.plot(xs, ys, 'D-', color='#d62728', label='torch transformer_xl (fp32)',
@@ -111,14 +110,26 @@ def main():
             ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, 6),
                         fontsize=9, color='#d62728')
 
-    # JAX reference (single line connecting available reference points)
+
+def _plot_hybrid(ax):
+    hyb_pts = _dedup_pts(HYBRID_DATA)
+    if hyb_pts:
+        xs, ys, ls = zip(*hyb_pts)
+        ax.plot(xs, ys, '*-', color='#8c564b', label='torch hybrid (LSTM + xl)',
+                markersize=12)
+        for x, y, l in hyb_pts:
+            ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, 6),
+                        fontsize=9, color='#8c564b')
+
+
+def _plot_refs(ax):
     if JAX_REF:
         xs, ys, ls = zip(*JAX_REF)
-        ax.plot(xs, ys, '^--', color='#2ca02c', label='jax (bf16, reference)', markersize=8, alpha=0.7)
+        ax.plot(xs, ys, '^--', color='#2ca02c', label='jax (bf16, reference)',
+                markersize=8, alpha=0.7)
         for x, y, l in JAX_REF:
-            ax.annotate(l, (x, y), textcoords='offset points', xytext=(-8, -14), fontsize=9, color='#2ca02c')
-
-    # NNCP v2 reference (the published bar we're trying to beat)
+            ax.annotate(l, (x, y), textcoords='offset points', xytext=(-8, -14),
+                        fontsize=9, color='#2ca02c')
     if NNCP_REF:
         xs, ys, ls = zip(*NNCP_REF)
         ax.plot(xs, ys, 'v--', color='#9467bd', label='nncp-base (fp16, reference)',
@@ -127,16 +138,35 @@ def main():
             ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, -14),
                         fontsize=9, color='#9467bd')
 
+
+def _format_axis(ax, title):
     ax.set_xscale('log')
     ax.set_xlabel('file size (bytes)')
     ax.set_ylabel('bpc (bits per byte of original)')
-    ax.set_title('Compression rate vs file size — torch_compress (LSTM vs Transformer-XL)')
+    ax.set_title(title)
     ax.grid(True, which='both', alpha=0.3)
     ax.legend(loc='upper right')
-
-    # Annotate the entropy floor for English text
+    # Entropy floor annotation
     ax.axhline(y=0.91, color='gray', linestyle=':', alpha=0.5)
     ax.annotate('≈ entropy floor (~0.9 bpc)', xy=(2e4, 0.95), color='gray', fontsize=8)
+
+
+def main():
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(8, 11), sharex=True, sharey=True)
+
+    # Top panel: solo models (LSTM, Transformer-XL) with reference points.
+    _plot_lstm(ax_top)
+    _plot_transformer_xl(ax_top)
+    _plot_refs(ax_top)
+    _format_axis(ax_top, 'Solo models — LSTM vs Transformer-XL')
+
+    # Bottom panel: hybrid alongside both solos and reference points so the
+    # ensemble win/loss vs each solo is directly visible.
+    _plot_lstm(ax_bot)
+    _plot_transformer_xl(ax_bot)
+    _plot_hybrid(ax_bot)
+    _plot_refs(ax_bot)
+    _format_axis(ax_bot, 'Hybrid ensemble — LSTM + Transformer-XL geometric mean')
 
     fig.tight_layout()
     fig.savefig(OUT_PATH, dpi=140)
