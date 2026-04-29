@@ -33,16 +33,16 @@ DATA = [
 # the Phase 4A sanity check (--preprocess none, since NNCP preprocessing
 # isn't useful at 10 KB and at-scale comparison uses byte-level there too).
 XL_DATA = [
-    # NOTE: the bf16 transformer runs we did had a non-deterministic retrain
-    # path (autocast + use_deterministic_algorithms(True) silently picked a
-    # non-deterministic bf16 kernel during retrain) -- bytes did not round-
-    # trip on enwik6+ even though the streaming-only enwik4/5 bf16 runs did.
-    # Rolling back to the valid fp32 numbers until bf16 is fixed properly.
-    (    10_000, 4.4360, 'enwik4', 'fp32', 'none'),
-    (   100_000, 3.4981, 'enwik5', 'fp32', 'nncp'),
-    ( 1_000_000, 2.4986, 'enwik6', 'fp32', 'nncp'),
-    # (10_000_000, ?, 'enwik7', 'fp32', 'nncp'),
-    # (100_000_000, ?, 'enwik8', 'fp32', 'nncp'),
+    # bf16 round-trip safe after commit 7611a88 set
+    # torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    # in IMPORTS_SRC. md5 of decompressed file == md5 of original on every
+    # row below (verified in the Validation cell of each papermill output).
+    # bpc is within 0.001 of the fp32 numbers; differences below noise.
+    (    10_000, 4.4352, 'enwik4', 'bf16', 'none'),
+    (   100_000, 3.4981, 'enwik5', 'bf16', 'nncp'),
+    ( 1_000_000, 2.4985, 'enwik6', 'bf16', 'nncp'),
+    # (10_000_000, ?, 'enwik7', 'bf16', 'nncp'),
+    # (100_000_000, ?, 'enwik8', 'bf16', 'nncp'),
 ]
 
 # JAX reference points (from the jax-compress README)
