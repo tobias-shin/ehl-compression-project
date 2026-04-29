@@ -152,22 +152,12 @@ def _format_axis(ax, title):
 
 
 def main():
-    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(8, 11), sharex=True, sharey=True)
-
-    # Top panel: solo models (LSTM, Transformer-XL) with reference points.
-    _plot_lstm(ax_top)
-    _plot_transformer_xl(ax_top)
-    _plot_refs(ax_top)
-    _format_axis(ax_top, 'Solo models — LSTM vs Transformer-XL')
-
-    # Bottom panel: hybrid alongside both solos and reference points so the
-    # ensemble win/loss vs each solo is directly visible.
-    _plot_lstm(ax_bot)
-    _plot_transformer_xl(ax_bot)
-    _plot_hybrid(ax_bot)
-    _plot_refs(ax_bot)
-    _format_axis(ax_bot, 'Hybrid ensemble — LSTM + Transformer-XL geometric mean')
-
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    _plot_lstm(ax)
+    _plot_transformer_xl(ax)
+    _plot_hybrid(ax)
+    _plot_refs(ax)
+    _format_axis(ax, 'Compression rate vs file size — torch_compress (LSTM, Transformer-XL, Hybrid)')
     fig.tight_layout()
     fig.savefig(OUT_PATH, dpi=140)
     print(f'wrote {OUT_PATH}')
