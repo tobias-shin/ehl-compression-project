@@ -33,15 +33,21 @@ DATA = [
 # the Phase 4A sanity check (--preprocess none, since NNCP preprocessing
 # isn't useful at 10 KB and at-scale comparison uses byte-level there too).
 XL_DATA = [
-    # All fp32 -- bf16 mixed precision is round-trip safe (commit 7611a88) but
-    # at these file sizes is ~8% slower than fp32 on GH200 with no bpc benefit
-    # (differences below 0.001). Run with --use-bf16 to opt in. md5 round-trip
-    # verified in each papermill Validation cell.
+    # enwik4-7 are fp32. bf16 mixed precision is round-trip safe (commit
+    # 7611a88) but at these file sizes is ~8% slower than fp32 on GH200 with
+    # no bpc benefit (differences below 0.001). Run with --use-bf16 to opt in.
+    # md5 round-trip verified in each papermill Validation cell.
     (    10_000, 4.4360, 'enwik4', 'fp32', 'none'),
     (   100_000, 3.4981, 'enwik5', 'fp32', 'nncp'),
     ( 1_000_000, 2.4986, 'enwik6', 'fp32', 'nncp'),
     (10_000_000, 1.8704, 'enwik7', 'fp32', 'nncp'),
-    # (100_000_000, ?, 'enwik8', 'fp32', 'nncp'),  # next; --mode compress to halve wall clock
+    # enwik8 is bf16 (--use-bf16 --mode compress) -- bf16 actually came out
+    # ~25% faster than the fp32 estimate at this scale (3h52m vs ~5h
+    # projected). Round-trip not verified on this run because --mode compress
+    # skipped the decode pass; bf16 round-trip is verified at enwik4-6 so
+    # extrapolation is plausible but not formally checked here. bpc difference
+    # vs an fp32 enwik8 run would be < 0.001 based on the smaller-size data.
+    (100_000_000, 1.3900, 'enwik8', 'bf16', 'nncp'),
 ]
 
 # JAX reference points (from the jax-compress README)
