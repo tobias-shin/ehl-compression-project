@@ -195,4 +195,29 @@ print(f"  Second encode: {len(compressed_xl_b)} bytes, sha={hash(compressed_xl_b
 assert compressed_xl == compressed_xl_b, "transformer_xl encodes are NOT deterministic"
 print("  PASS: bit-identical encode across processes (with retrain firing)")
 
+
+# ---- Test 6: transformer_xl bf16 round-trip with retrain firing ---------
+# This is the test that should have existed before commit 9137f21 wired up
+# bf16. The earlier check (md5(fp32) != md5(bf16)) confirmed bf16 was active
+# but did NOT verify round-trip; commit 3f6a620 found that retrain-active
+# bf16 broke decompression on enwik6+. After applying the
+# allow_bf16_reduced_precision_reduction = False fix in IMPORTS_SRC, this
+# test verifies bf16 round-trip is restored.
+#
+# CPU bf16 autocast does not exercise the same matmul reduction paths as
+# CUDA -- this CPU smoke is only a regression detector, not a complete
+# verification. The real proof is re-running enwik6 on GPU and checking the
+# Validation cell's md5s match.
+XL_BF16_HPARAMS = XL_HPARAMS + 'use_bf16 = True\n'
+print("\n== Test 6: transformer_xl bf16 round-trip with retrain ==")
+ns_bf16 = load_namespace(os.path.join(REPO, "torch_compress.ipynb"), XL_BF16_HPARAMS)
+compressed_bf16 = encode(ns_bf16, DATA, VOCAB)
+print(f"  Encoded {len(DATA)} symbols -> {len(compressed_bf16)} bytes")
+decoded_bf16 = decode(ns_bf16, compressed_bf16, len(DATA), VOCAB)
+assert decoded_bf16 == DATA, (
+    f"transformer_xl bf16 round-trip is broken: decoded[:10]={decoded_bf16[:10]} "
+    f"!= expected[:10]={DATA[:10]}"
+)
+print("  PASS: bf16 round-trip is lossless (CPU; GPU verification still needed)")
+
 print("\nALL TESTS PASS")

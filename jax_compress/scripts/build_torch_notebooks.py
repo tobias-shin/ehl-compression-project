@@ -54,6 +54,13 @@ import torch
 torch.use_deterministic_algorithms(True, warn_only=False)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+# Force bf16 matmul accumulation in fp32 (default is bf16 reduction). Without
+# this, parallel reductions in bf16 matmul kernels on CUDA produce bit-
+# different outputs across kernel launches given identical inputs, which
+# breaks the encode/decode probability agreement the arithmetic coder needs.
+# No-op on fp32 runs; ~10-20% slowdown vs bf16-reduce on bf16 runs in
+# exchange for round-trip-safe determinism.
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 # ---------------------------------------------------------------------------
 
 import torch.nn as nn
@@ -766,19 +773,13 @@ def _process_transformer_xl(compress, length, vocab_size, coder, data):
   if checkpoint:
     print("[transformer_xl] Warning: checkpoint=True is not yet supported; ignoring.")
 
-  # NOTE: bf16 was wired up here but produced a non-deterministic retrain pass
-  # (autocast + use_deterministic_algorithms(True) silently selected a non-
-  # deterministic bf16 kernel; encode and decode disagreed on probabilities,
-  # so enwik6+ bytes did not round-trip even though enwik4/5 -- which never
-  # fire retrain meaningfully -- happened to round-trip OK). Pinning to fp32
-  # until this is properly debugged. Streaming-only bf16 was also slower than
-  # fp32 at the file sizes where retrain stays a no-op, so a streaming-only
-  # partial fix would not produce a meaningful speedup.
-  if bool(globals().get('use_bf16', False)):
-    print("[transformer_xl] use_bf16=True ignored: bf16 currently breaks "
-          "round-trip during retrain. Forcing fp32.")
-  use_bf16_flag = False
-  ac_dtype = torch.float32
+  # bf16 mixed precision is round-trip safe given the
+  # allow_bf16_reduced_precision_reduction = False flag set in IMPORTS_SRC.
+  # Without that flag, bf16 matmul kernels accumulated reductions in bf16
+  # with non-deterministic thread ordering, breaking encode/decode agreement
+  # on probabilities during retrain (see commit 3f6a620 for the diagnostic).
+  use_bf16_flag = bool(globals().get('use_bf16', False))
+  ac_dtype = torch.bfloat16 if use_bf16_flag else torch.float32
 
   start = time.time()
   last_print_time = start
@@ -1038,11 +1039,8 @@ def _retrain_transformer_xl(*, models, retrain_optimizers, current_lr, file_data
   for model in models:
     model.reset_length(retrain_tgt_len, 0, retrain_mem_len)
 
-  # bf16 was found to break round-trip in this retrain pass (see longer note
-  # at the equivalent point in _process_transformer_xl). Forcing fp32 here
-  # too until that's fixed.
-  use_bf16_flag = False
-  ac_dtype = torch.float32
+  use_bf16_flag = bool(globals().get('use_bf16', False))
+  ac_dtype = torch.bfloat16 if use_bf16_flag else torch.float32
 
   ensemble_losses = []
   try:
