@@ -41,8 +41,9 @@ XL_DATA = [
     (    10_000, 4.4352, 'enwik4', 'bf16', 'none'),
     (   100_000, 3.4981, 'enwik5', 'bf16', 'nncp'),
     ( 1_000_000, 2.4985, 'enwik6', 'bf16', 'nncp'),
-    # (10_000_000, ?, 'enwik7', 'bf16', 'nncp'),
-    # (100_000_000, ?, 'enwik8', 'bf16', 'nncp'),
+    # enwik7 was run in fp32 (mode=both) -- 48.8 min wall, md5 match.
+    (10_000_000, 1.8704, 'enwik7', 'fp32', 'nncp'),
+    # (100_000_000, ?, 'enwik8', 'fp32', 'nncp'),  # next; --mode compress to halve wall clock
 ]
 
 # JAX reference points (from the jax-compress README)
