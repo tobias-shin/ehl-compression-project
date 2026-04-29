@@ -33,15 +33,13 @@ DATA = [
 # the Phase 4A sanity check (--preprocess none, since NNCP preprocessing
 # isn't useful at 10 KB and at-scale comparison uses byte-level there too).
 XL_DATA = [
-    # bf16 round-trip safe after commit 7611a88 set
-    # torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-    # in IMPORTS_SRC. md5 of decompressed file == md5 of original on every
-    # row below (verified in the Validation cell of each papermill output).
-    # bpc is within 0.001 of the fp32 numbers; differences below noise.
-    (    10_000, 4.4352, 'enwik4', 'bf16', 'none'),
-    (   100_000, 3.4981, 'enwik5', 'bf16', 'nncp'),
-    ( 1_000_000, 2.4985, 'enwik6', 'bf16', 'nncp'),
-    # enwik7 was run in fp32 (mode=both) -- 48.8 min wall, md5 match.
+    # All fp32 -- bf16 mixed precision is round-trip safe (commit 7611a88) but
+    # at these file sizes is ~8% slower than fp32 on GH200 with no bpc benefit
+    # (differences below 0.001). Run with --use-bf16 to opt in. md5 round-trip
+    # verified in each papermill Validation cell.
+    (    10_000, 4.4360, 'enwik4', 'fp32', 'none'),
+    (   100_000, 3.4981, 'enwik5', 'fp32', 'nncp'),
+    ( 1_000_000, 2.4986, 'enwik6', 'fp32', 'nncp'),
     (10_000_000, 1.8704, 'enwik7', 'fp32', 'nncp'),
     # (100_000_000, ?, 'enwik8', 'fp32', 'nncp'),  # next; --mode compress to halve wall clock
 ]
@@ -96,7 +94,7 @@ def main():
         xl_pts.append(seen[s])
     if xl_pts:
         xs, ys, ls = zip(*xl_pts)
-        ax.plot(xs, ys, 'D-', color='#d62728', label='torch transformer_xl',
+        ax.plot(xs, ys, 'D-', color='#d62728', label='torch transformer_xl (fp32)',
                 markersize=8)
         for x, y, l in xl_pts:
             ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, 6),

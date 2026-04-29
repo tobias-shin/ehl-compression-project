@@ -194,6 +194,7 @@ retrain_tgt_len = {args.retrain_tgt_len}
 retrain_mem_len = {args.retrain_mem_len}
 learning_rate_schedule_xl = "{args.xl_lr_schedule}"
 retrain_lr_schedule_xl = "{args.xl_retrain_lr_schedule}"
+use_bf16 = {bool(args.use_bf16)}
 """
 
 
@@ -263,6 +264,14 @@ def main():
     ap.add_argument('--xl-retrain-lr-schedule',
                     default="0:4.0e-4 13000:2.0e-4 93000:1.0e-4 163000:5.0e-5 1911300:1.6e-5",
                     help="retrain LR schedule used when model_type == transformer_xl")
+    # ---- Mixed precision -------------------------------------------------
+    # Default fp32 (matches run_papermill.py default) -- bf16 mixed precision
+    # is round-trip safe on the transformer path post-commit 7611a88, but at
+    # the file sizes typically driven from this CLI it's slightly slower than
+    # fp32. Set --use-bf16 to opt in.
+    ap.add_argument('--use-bf16', dest='use_bf16', action='store_true')
+    ap.add_argument('--no-bf16', dest='use_bf16', action='store_false')
+    ap.set_defaults(use_bf16=False)
     args = ap.parse_args()
     if args.no_retrain:
         args.retrain_period = "0:1000000000"
