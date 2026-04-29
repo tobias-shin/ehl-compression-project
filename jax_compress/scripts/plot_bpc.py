@@ -41,13 +41,18 @@ XL_DATA = [
     (   100_000, 3.4981, 'enwik5', 'fp32', 'nncp'),
     ( 1_000_000, 2.4986, 'enwik6', 'fp32', 'nncp'),
     (10_000_000, 1.8704, 'enwik7', 'fp32', 'nncp'),
-    # enwik8 is bf16 (--use-bf16 --mode compress) -- bf16 actually came out
-    # ~25% faster than the fp32 estimate at this scale (3h52m vs ~5h
-    # projected). Round-trip not verified on this run because --mode compress
-    # skipped the decode pass; bf16 round-trip is verified at enwik4-6 so
-    # extrapolation is plausible but not formally checked here. bpc difference
-    # vs an fp32 enwik8 run would be < 0.001 based on the smaller-size data.
-    (100_000_000, 1.3900, 'enwik8', 'bf16', 'nncp'),
+    # enwik8 is bf16 (--use-bf16 --mode compress) with NNCP-aligned data-
+    # pipeline hparams: batch_size=64, n_words=16384, retrain_block_len=10M,
+    # retrain_batch_size=32, retrain_period_schedule="0:7813". Round-trip not
+    # verified (--mode compress skipped decode); bf16 round-trip is verified
+    # at enwik4-6 so extrapolation is plausible but not formally checked.
+    # The original-defaults run at this size hit 1.3900 bpc in 3h52m;
+    # NNCP-alignment improved to 1.3734 in 6h40m -- only 0.017 bpc lower
+    # despite 2x wall clock. The remaining gap to NNCP-base's ~1.0 bpc is
+    # likely a mix of: clip=4.0 (vs NNCP 0.25), bf16 vs fp16 numerics, the
+    # absence of NNCP-style block_len mems-reset, and the LR schedule
+    # transition firing very late in our 344K-step run.
+    (100_000_000, 1.3734, 'enwik8', 'bf16', 'nncp'),
 ]
 
 # JAX reference points (from the jax-compress README)
