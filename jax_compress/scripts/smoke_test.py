@@ -220,4 +220,58 @@ assert decoded_bf16 == DATA, (
 )
 print("  PASS: bf16 round-trip is lossless (CPU; GPU verification still needed)")
 
+
+# ---- hybrid backend ------------------------------------------------------
+# LSTM + Transformer-XL ensemble that geometric-mean-combines per-step
+# probabilities and backprops each submodel independently. Tiny config so
+# the test stays fast on CPU. Retrain is set to fire during the 16-step run
+# (catches both LSTM batched retrain and the NNCP-style transformer retrain
+# being driven from the same _retrain_hybrid call).
+HYBRID_HPARAMS = HPARAMS + """
+model_type = "hybrid"
+n_layer = 2
+n_head = 2
+d_model = 16
+d_head = 8
+d_inner = 32
+mem_len = 8
+ext_tgt_len = 3
+attn_type = 1
+tied_r_bias = True
+use_gelu = True
+dropout = 0.0
+dropatt = 0.0
+init_std = 0.013
+retrain_tgt_len = 2
+retrain_mem_len = 4
+learning_rate_schedule_xl = "0:0.005"
+retrain_lr_schedule_xl = "0:0.001"
+use_bf16 = False
+"""
+HYBRID_HPARAMS = HYBRID_HPARAMS.replace(
+    'retrain_period_schedule = "0:1000000"',
+    'retrain_period_schedule = "0:5"',
+)
+
+# ---- Test 7: hybrid round-trip ------------------------------------------
+print("\n== Test 7: torch_compress.ipynb (hybrid) round-trip with retrain ==")
+ns_hyb = load_namespace(os.path.join(REPO, "torch_compress.ipynb"), HYBRID_HPARAMS)
+compressed_hyb = encode(ns_hyb, DATA, VOCAB)
+print(f"  Encoded {len(DATA)} symbols -> {len(compressed_hyb)} bytes")
+decoded_hyb = decode(ns_hyb, compressed_hyb, len(DATA), VOCAB)
+assert decoded_hyb == DATA, (
+    f"hybrid round-trip is broken: decoded[:10]={decoded_hyb[:10]} "
+    f"!= expected[:10]={DATA[:10]}"
+)
+print("  PASS: hybrid round-trip is lossless (with retrain firing)")
+
+# ---- Test 8: hybrid determinism -----------------------------------------
+print("\n== Test 8: hybrid determinism (two compress runs, same seed) ==")
+ns_hyb2 = load_namespace(os.path.join(REPO, "torch_compress.ipynb"), HYBRID_HPARAMS)
+compressed_hyb_b = encode(ns_hyb2, DATA, VOCAB)
+print(f"  First encode:  {len(compressed_hyb)} bytes, sha={hash(compressed_hyb)}")
+print(f"  Second encode: {len(compressed_hyb_b)} bytes, sha={hash(compressed_hyb_b)}")
+assert compressed_hyb == compressed_hyb_b, "hybrid encodes are NOT deterministic"
+print("  PASS: bit-identical encode across processes (hybrid)")
+
 print("\nALL TESTS PASS")

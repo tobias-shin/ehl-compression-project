@@ -242,7 +242,7 @@ def main():
     # the NNCP-style streaming + retraining loop. The rest of the --xl-* flags
     # default to NNCP_v2 nncp_enwik_base.sh values; they are read only when
     # model_type == "transformer_xl".
-    ap.add_argument('--model-type', choices=['lstm', 'transformer_xl'], default='lstm')
+    ap.add_argument('--model-type', choices=['lstm', 'transformer_xl', 'hybrid'], default='lstm')
     ap.add_argument('--n-layer', type=int, default=12)
     ap.add_argument('--n-head', type=int, default=8)
     ap.add_argument('--d-model', type=int, default=512)

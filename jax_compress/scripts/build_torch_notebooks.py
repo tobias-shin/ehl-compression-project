@@ -235,6 +235,34 @@ def build_model(model_type, *, vocab_size, embedding_size, rnn_units, num_layers
         use_gelu=g.get('use_gelu', True),
         init_std=g.get('init_std', 0.02),
     )
+  if model_type == "hybrid":
+    # Construct LSTM + Transformer-XL via the same code paths used for the
+    # solo cases, then wrap them in HybridModel. Both submodels are unmodified;
+    # the hybrid is purely composition.
+    lstm = LSTMModel(vocab_size=vocab_size, embedding_size=embedding_size,
+                     rnn_units=rnn_units, num_layers=num_layers,
+                     dropout_rate=dropout_rate)
+    from models.transformer_xl import TransformerXLModel
+    g = globals()
+    xl = TransformerXLModel(
+        vocab_size=vocab_size,
+        n_layer=g.get('n_layer', 12),
+        n_head=g.get('n_head', 8),
+        d_model=g.get('d_model', 512),
+        d_head=g.get('d_head', 64),
+        d_inner=g.get('d_inner', 2048),
+        dropout=g.get('dropout', 0.0),
+        dropatt=g.get('dropatt', 0.0),
+        tgt_len=1,
+        ext_len=g.get('ext_tgt_len', 31),
+        mem_len=g.get('mem_len', 160),
+        attn_type=g.get('attn_type', 1),
+        tied_r_bias=g.get('tied_r_bias', True),
+        use_gelu=g.get('use_gelu', True),
+        init_std=g.get('init_std', 0.02),
+    )
+    from models.hybrid import HybridModel
+    return HybridModel(lstm, xl)
   raise ValueError(f"unknown model_type: {model_type!r}")
 '''
 
@@ -408,10 +436,15 @@ def process(compress, length, vocab_size, coder, data):
   history, and drives the arithmetic coder one symbol at a time.
 
   When ``model_type == "transformer_xl"``, dispatches to the NNCP-style
-  streaming loop in ``_process_transformer_xl`` instead.
+  streaming loop in ``_process_transformer_xl`` instead. When ``model_type ==
+  "hybrid"``, dispatches to the LSTM + Transformer-XL ensemble loop in
+  ``_process_hybrid``.
   """
-  if globals().get('model_type', 'lstm') == 'transformer_xl':
+  _mt = globals().get('model_type', 'lstm')
+  if _mt == 'transformer_xl':
     return _process_transformer_xl(compress, length, vocab_size, coder, data)
+  if _mt == 'hybrid':
+    return _process_hybrid(compress, length, vocab_size, coder, data)
   start = time.time()
   last_print_time = start
   reset_seed()
@@ -1097,6 +1130,369 @@ def _retrain_transformer_xl(*, models, retrain_optimizers, current_lr, file_data
       model.reset_length(1, 0, stream_mem_len)
 
   return float(np.mean(ensemble_losses)) if ensemble_losses else 0.0
+
+
+def _process_hybrid(compress, length, vocab_size, coder, data):
+  """LSTM + Transformer-XL hybrid streaming loop with geometric-mean ensembling.
+
+  At every step both submodels forward against the same just-coded symbol
+  context. AC sees ``softmax(0.5 * (log_softmax(lstm_logits) +
+  log_softmax(xl_logits)))`` -- the geometric mean of the two distributions.
+  Each submodel backprops independently against the actual symbol with its
+  own optimizer (and its own LR schedule).
+
+  Per-submodel state management mirrors each model's solo loop:
+    - LSTM: states_queue of seq_length snapshots, BPTT replay through the
+      window, push detached state after the forward.
+    - Transformer-XL: mems list, carries forward via _update_mems inside the
+      model. Pre-cast to bf16 if use_bf16; reset to empty after retrain.
+
+  Limitations:
+  - ensemble_size > 1 is rejected here -- each "ensemble member" is itself a
+    hybrid pair, and stacking multiple hybrids would double-count parameters
+    in unhelpful ways. Use a separate run with model_type="lstm" or
+    "transformer_xl" if you want to homogeneous-ensemble.
+  - Multi-part / checkpointing not supported (asserts current_part == 1).
+  """
+  assert current_part == 1 and total_parts == 1, (
+      "hybrid backend currently supports only single-part runs."
+  )
+  assert ensemble_size == 1, (
+      "hybrid backend currently supports only ensemble_size=1; the hybrid "
+      "itself is already a 2-model ensemble."
+  )
+  if checkpoint:
+    print("[hybrid] Warning: checkpoint=True is not yet supported; ignoring.")
+
+  # bf16 mixed precision: applies only to the Transformer-XL submodel's
+  # forward (LSTM cell loop runs in fp32 regardless -- bf16 isn't wired into
+  # LSTMModel and the BPTT compounding makes it risky there).
+  use_bf16_flag = bool(globals().get('use_bf16', False))
+  ac_dtype = torch.bfloat16 if use_bf16_flag else torch.float32
+
+  start = time.time()
+  last_print_time = start
+  reset_seed()
+  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+  tb_writer = None
+  if globals().get('tensorboard', False):
+    from torch.utils.tensorboard import SummaryWriter
+    _tb_logdir = globals().get('tensorboard_logdir', 'data/tensorboard')
+    _tb_run = globals().get('tensorboard_run_name', 'torch_compress')
+    tb_writer = SummaryWriter(log_dir=os.path.join(_tb_logdir, _tb_run))
+    tb_writer.add_text('config', (
+        f"backend=torch model=hybrid device={device} "
+        f"batch_size={batch_size} seq_length={seq_length} "
+        f"rnn_units={rnn_units} num_layers={num_layers} "
+        f"embedding_size={embedding_size} ext_tgt_len={ext_tgt_len} "
+        f"mem_len={mem_len} n_layer={n_layer} d_model={d_model}"
+    ))
+
+  # Two LR schedules: LSTM uses learning_rate_schedule (its tuned default);
+  # Transformer-XL uses learning_rate_schedule_xl (NNCP-base default).
+  lstm_lr_schedule = parse_schedule(learning_rate_schedule)
+  xl_lr_schedule_str = globals().get('learning_rate_schedule_xl', learning_rate_schedule)
+  xl_lr_schedule = parse_schedule(xl_lr_schedule_str)
+  retrain_p_schedule = parse_schedule(retrain_period_schedule)
+  retrain_l_schedule = parse_schedule(retrain_lr_schedule)
+  retrain_l_schedule_xl_str = globals().get('retrain_lr_schedule_xl', retrain_lr_schedule)
+  retrain_l_schedule_xl = parse_schedule(retrain_l_schedule_xl_str)
+
+  initial_lstm_lr = lstm_lr_schedule[0][1] if lstm_lr_schedule else 5e-4
+  initial_xl_lr = xl_lr_schedule[0][1] if xl_lr_schedule else 7.9e-5
+
+  # Build hybrid model + per-submodel optimizers.
+  model = build_model('hybrid', vocab_size=vocab_size, embedding_size=embedding_size,
+                      rnn_units=rnn_units, num_layers=num_layers,
+                      dropout_rate=retrain_dropout).to(device)
+
+  lstm_opt = torch.optim.Adam(
+      model.lstm.parameters(), lr=initial_lstm_lr, betas=(adam_b1, adam_b2), eps=adam_eps)
+  xl_opt = torch.optim.Adam(
+      model.transformer_xl.parameters(), lr=initial_xl_lr, betas=(adam_b1, adam_b2), eps=adam_eps)
+  # Separate retrain optimizer state per submodel (lr=1.0 placeholder; per-step set).
+  lstm_retrain_opt = torch.optim.Adam(
+      model.lstm.parameters(), lr=1.0, betas=(adam_b1, adam_b2), eps=adam_eps)
+  xl_retrain_opt = torch.optim.Adam(
+      model.transformer_xl.parameters(), lr=1.0, betas=(adam_b1, adam_b2), eps=adam_eps)
+
+  total_params = sum(p.numel() for p in model.parameters())
+  lstm_params = sum(p.numel() for p in model.lstm.parameters())
+  xl_params = sum(p.numel() for p in model.transformer_xl.parameters())
+  print("\\n" + "=" * 80)
+  print(f"Hybrid LSTM + Transformer-XL")
+  print("=" * 80)
+  print(f"LSTM submodel parameters:           {lstm_params:,}")
+  print(f"Transformer-XL submodel parameters: {xl_params:,}")
+  print(f"Total parameters:                   {total_params:,}")
+  print("=" * 80 + "\\n")
+
+  split = math.ceil(length / batch_size)
+  end_pos = split
+
+  # Uniform prior used to AC-code the very first symbol of each parallel stream.
+  freq = np.cumsum(np.full(vocab_size, (1.0 / vocab_size)) * 10000000 + 1)
+
+  qlen_xl = ext_tgt_len + 1  # Transformer streaming window
+  # LSTM streaming window is `seq_length` (same param the LSTM solo path uses).
+
+  initial_symbols = []
+  for i in range(batch_size):
+    initial_symbols.append(get_symbol(i * split, length, freq, coder, compress, data))
+
+  # Two seq_input windows -- LSTM consumes `seq_length` tokens per step (with
+  # BPTT), Transformer-XL consumes `qlen_xl = ext_tgt_len + 1`. They slide in
+  # lockstep but can be different widths.
+  base = torch.tensor(initial_symbols, dtype=torch.long, device=device).unsqueeze(1)
+  lstm_seq_input = base.repeat(1, seq_length)
+  xl_seq_input = base.repeat(1, qlen_xl)
+
+  def fresh_lstm_states():
+    return model.lstm.init_states(batch_size, device)
+
+  lstm_states_queue = [fresh_lstm_states() for _ in range(seq_length)]
+
+  xl_mems = model.transformer_xl.init_states(batch_size, device)
+  if xl_mems is not None and ac_dtype != torch.float32:
+    xl_mems = [t.to(ac_dtype) for t in xl_mems]
+
+  cross_entropy = 0.0
+  denom = 0.0
+  template = '{:0.2f}%\\tcross entropy: {:0.2f}\\ttime: {:0.2f}\\tlstm_lr: {:0.6f}\\txl_lr: {:0.6f}\\tstep: {}'
+
+  pos = 0
+  current_lstm_lr = initial_lstm_lr
+  current_xl_lr = initial_xl_lr
+  last_retrain_pos = 0
+
+  while pos < end_pos:
+    # Per-step LR updates (each submodel uses its own schedule).
+    current_lstm_lr = get_scheduled_value(lstm_lr_schedule, pos)
+    current_xl_lr = get_scheduled_value(xl_lr_schedule, pos)
+    for g in lstm_opt.param_groups: g['lr'] = current_lstm_lr
+    for g in xl_opt.param_groups: g['lr'] = current_xl_lr
+
+    # Periodic retrain (both submodels retrain on the same retrain window in
+    # their respective shapes). Mems / states are reset after retrain since
+    # the weights changed underneath them.
+    current_retrain_period = get_scheduled_value(retrain_p_schedule, pos)
+    current_lstm_retrain_lr = get_scheduled_value(retrain_l_schedule, pos)
+    current_xl_retrain_lr = get_scheduled_value(retrain_l_schedule_xl, pos)
+    if current_retrain_period > 0 and (pos - last_retrain_pos) >= current_retrain_period:
+      retrain_start_time = time.time()
+      _retrain_hybrid(
+          model=model,
+          lstm_retrain_opt=lstm_retrain_opt,
+          xl_retrain_opt=xl_retrain_opt,
+          lstm_lr=current_lstm_retrain_lr,
+          xl_lr=current_xl_retrain_lr,
+          file_data=data,
+          file_pos=pos + 1,
+          split=split,
+          batch_size_streaming=batch_size,
+          retrain_block_len=retrain_block_len,
+          retrain_seq_length=retrain_seq_length,
+          retrain_batch_size_lstm=retrain_batch_size,
+          retrain_tgt_len=retrain_tgt_len,
+          retrain_mem_len=retrain_mem_len,
+          stream_mem_len=mem_len,
+          vocab_size=vocab_size,
+          device=device,
+      )
+      last_retrain_pos = pos
+      retrain_duration = time.time() - retrain_start_time
+      print(f"[hybrid] retrain done at step {pos}: duration={retrain_duration:.2f}s")
+      if tb_writer is not None:
+        tb_writer.add_scalar('retrain/duration_sec', retrain_duration, pos)
+        tb_writer.add_scalar('retrain/lstm_lr', current_lstm_retrain_lr, pos)
+        tb_writer.add_scalar('retrain/xl_lr', current_xl_retrain_lr, pos)
+      # Reset both submodels' running state -- pre-retrain activations are
+      # stale relative to the post-retrain weights.
+      lstm_states_queue = [fresh_lstm_states() for _ in range(seq_length)]
+      xl_mems = model.transformer_xl.init_states(batch_size, device)
+      if xl_mems is not None and ac_dtype != torch.float32:
+        xl_mems = [t.to(ac_dtype) for t in xl_mems]
+
+    # ---- Forward both submodels ----
+    # LSTM: pop the oldest state from queue, BPTT replay over seq_length
+    lstm_state_in = lstm_states_queue.pop(0)
+    lstm_logits, new_lstm_state = model.lstm(
+        lstm_seq_input, lstm_state_in, return_sequence=False, deterministic=True)
+
+    # Transformer-XL: forward with current mems under autocast
+    with torch.autocast(device_type=device.type, dtype=ac_dtype, enabled=use_bf16_flag):
+      xl_logits, new_xl_mems = model.transformer_xl(
+          xl_seq_input, xl_mems, return_sequence=False, deterministic=True)
+    xl_logits = xl_logits.float()
+
+    # ---- Combine: geometric-mean ensemble in log-prob space ----
+    log_probs_lstm = F.log_softmax(lstm_logits, dim=-1)
+    log_probs_xl = F.log_softmax(xl_logits, dim=-1)
+    mean_log_probs = 0.5 * (log_probs_lstm + log_probs_xl)
+    probs = F.softmax(mean_log_probs, dim=-1).detach().cpu().numpy()
+
+    # ---- Drive the AC: one symbol per parallel stream ----
+    current_symbols = []
+    current_mask = []
+    for i in range(batch_size):
+      freq_i = np.cumsum(probs[i] * 10000000 + 1)
+      index = pos + 1 + i * split
+      symbol = get_symbol(index, length, freq_i, coder, compress, data)
+      current_symbols.append(symbol)
+      current_mask.append(1.0 if index < length else 0.0)
+
+    symbols_t = torch.tensor(current_symbols, dtype=torch.long, device=device)
+    mask_t = torch.tensor(current_mask, dtype=torch.float32, device=device)
+
+    # ---- Backward: each submodel against the actual symbol, independently ----
+    # LSTM backward
+    lstm_opt.zero_grad()
+    lstm_loss_per = F.cross_entropy(lstm_logits, symbols_t, reduction='none')
+    lstm_loss = (lstm_loss_per * mask_t).sum()
+    lstm_loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.lstm.parameters(), 4.0)
+    lstm_opt.step()
+
+    # Transformer-XL backward
+    xl_opt.zero_grad()
+    xl_loss_per = F.cross_entropy(xl_logits, symbols_t, reduction='none')
+    xl_loss = (xl_loss_per * mask_t).sum()
+    xl_loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.transformer_xl.parameters(), 4.0)
+    xl_opt.step()
+
+    # ---- Compute ensemble cross-entropy for logging (using detached log_probs) ----
+    log_probs_lstm_d = F.log_softmax(lstm_logits.detach(), dim=-1)
+    log_probs_xl_d = F.log_softmax(xl_logits.detach(), dim=-1)
+    mean_log_probs_d = 0.5 * (log_probs_lstm_d + log_probs_xl_d)
+    one_hot = F.one_hot(symbols_t, num_classes=vocab_size).float()
+    loss_vals = -(one_hot * F.log_softmax(mean_log_probs_d, dim=-1)).sum(dim=-1)
+    cross_entropy += (loss_vals * mask_t).sum().item()
+    denom += mask_t.sum().item()
+
+    # ---- State carry ----
+    # LSTM: detach + push to queue
+    lstm_states_queue.append([(h.detach(), c.detach()) for (h, c) in new_lstm_state])
+    # Transformer-XL: mems already detached inside _update_mems
+    xl_mems = new_xl_mems
+
+    # Slide both windows by the just-coded symbol
+    symbols_unsq = symbols_t.unsqueeze(1)
+    lstm_seq_input = torch.cat([lstm_seq_input[:, 1:], symbols_unsq], dim=1)
+    xl_seq_input = torch.cat([xl_seq_input[:, 1:], symbols_unsq], dim=1)
+
+    pos += 1
+
+    if time.time() - last_print_time >= 20:
+      last_print_time = time.time()
+      time_diff = last_print_time - start
+      current_bpc = (cross_entropy / denom) / np.log(2)
+      print(template.format(
+          pos / split * 100, current_bpc, time_diff,
+          current_lstm_lr, current_xl_lr, pos))
+      if tb_writer is not None:
+        tb_writer.add_scalar('train/bpc', current_bpc, pos)
+        tb_writer.add_scalar('train/cross_entropy_total', cross_entropy, pos)
+        tb_writer.add_scalar('train/lstm_lr', current_lstm_lr, pos)
+        tb_writer.add_scalar('train/xl_lr', current_xl_lr, pos)
+        tb_writer.add_scalar('train/elapsed_sec', time_diff, pos)
+        tb_writer.add_scalar('train/steps_per_sec', pos / time_diff if time_diff > 0 else 0.0, pos)
+
+  if tb_writer is not None:
+    final_time = time.time() - start
+    if denom > 0:
+      tb_writer.add_scalar('train/bpc', (cross_entropy / denom) / np.log(2), pos)
+    tb_writer.add_scalar('train/elapsed_sec', final_time, pos)
+    tb_writer.add_text('summary', (
+        f"final_pos={pos} elapsed_sec={final_time:.2f} "
+        f"final_bpc={(cross_entropy / denom) / np.log(2) if denom > 0 else float('nan'):.4f}"
+    ))
+    tb_writer.flush()
+    tb_writer.close()
+
+
+def _retrain_hybrid(*, model, lstm_retrain_opt, xl_retrain_opt, lstm_lr, xl_lr,
+                    file_data, file_pos, split, batch_size_streaming,
+                    retrain_block_len, retrain_seq_length,
+                    retrain_batch_size_lstm,
+                    retrain_tgt_len, retrain_mem_len,
+                    stream_mem_len, vocab_size, device):
+  """Retrain both submodels on the same trailing window in their native shapes.
+
+  - LSTM: BPTT batches of (retrain_seq_length+1)-token sequences over the
+    last ``retrain_block_len`` chars, sharded across the same parallel-stream
+    layout the streaming loop uses (i.e. each stream's history is its own
+    column). This mirrors the data-construction code embedded in the LSTM
+    solo retrain block of ``process()`` exactly; if that body changes,
+    update here.
+  - Transformer-XL: NNCP-style streaming pass via ``_retrain_transformer_xl``,
+    which itself reset_lengths the model to (retrain_tgt_len, 0,
+    retrain_mem_len) and back. Each retrain pass on the trailing
+    ``retrain_block_len`` chars (capped at retrain_block_len for our
+    transformer's retrain_block_len which is independent of the LSTM one).
+
+  Both retrains see the same recent data but in different shapes; each
+  updates only its own submodel.
+  """
+  # ---- LSTM half ----
+  pos = file_pos - 1  # streaming step at retrain trigger
+  r_start_step = max(0, pos - retrain_block_len)
+  r_end_step = pos
+
+  all_inputs = []
+  all_targets = []
+  r_step = r_start_step
+  while r_step < r_end_step:
+    for i in range(batch_size_streaming):
+      base_idx = r_step + i * split
+      start_idx = base_idx
+      end_idx = start_idx + retrain_seq_length + 1
+      current_stream_limit = i * split + pos + 1
+      stream_segment = file_data[start_idx: min(end_idx, current_stream_limit)]
+      if len(stream_segment) < retrain_seq_length + 1:
+        stream_segment = list(stream_segment) + [0] * (retrain_seq_length + 1 - len(stream_segment))
+      all_inputs.append(stream_segment[:-1])
+      all_targets.append(stream_segment[1:])
+    r_step += retrain_seq_length
+
+  if all_inputs:
+    all_inputs_t = torch.tensor(all_inputs, dtype=torch.long, device=device)
+    all_targets_t = torch.tensor(all_targets, dtype=torch.long, device=device)
+
+    total_examples = all_inputs_t.shape[0]
+    remainder = total_examples % retrain_batch_size_lstm
+    if remainder != 0:
+      all_inputs_t = all_inputs_t[:-remainder]
+      all_targets_t = all_targets_t[:-remainder]
+      total_examples -= remainder
+
+    if total_examples > 0:
+      for i in range(0, total_examples, retrain_batch_size_lstm):
+        batch_inputs = all_inputs_t[i: i + retrain_batch_size_lstm]
+        batch_targets = all_targets_t[i: i + retrain_batch_size_lstm]
+        # Reuse the same retrain_step helper used by the LSTM solo path,
+        # but with a single-element model list and the LSTM submodel.
+        retrain_step([model.lstm], [lstm_retrain_opt], batch_inputs, batch_targets, lstm_lr)
+
+  # ---- Transformer-XL half ----
+  # Reuse the existing _retrain_transformer_xl helper exactly as the
+  # transformer solo path does; pass [model.transformer_xl] as the
+  # single-element models list.
+  _retrain_transformer_xl(
+      models=[model.transformer_xl],
+      retrain_optimizers=[xl_retrain_opt],
+      current_lr=xl_lr,
+      file_data=file_data,
+      file_pos=file_pos,
+      retrain_block_len=retrain_block_len,
+      retrain_tgt_len=retrain_tgt_len,
+      retrain_mem_len=retrain_mem_len,
+      retrain_batch_size=retrain_batch_size_lstm,
+      stream_mem_len=stream_mem_len,
+      vocab_size=vocab_size,
+      device=device,
+  )
 '''
 
 
