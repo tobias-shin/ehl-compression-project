@@ -90,9 +90,9 @@ HYBRID_DATA = [
 # HYBRID_DATA at convergence; should win modestly at every scale and more
 # meaningfully where one submodel is much better than the other.
 HYBRID_MIXER_DATA = [
-    # (    10_000, ?, 'enwik4', 'fp32', 'none'),
-    # (   100_000, ?, 'enwik5', 'fp32', 'nncp'),
-    # ( 1_000_000, ?, 'enwik6', 'fp32', 'nncp'),
+    (    10_000, 3.6656, 'enwik4', 'fp32', 'none'),
+    (   100_000, 2.6597, 'enwik5', 'fp32', 'nncp'),
+    ( 1_000_000, 1.9934, 'enwik6', 'fp32', 'nncp'),
     # (10_000_000, ?, 'enwik7', 'fp32', 'nncp'),
     # (100_000_000, ?, 'enwik8', 'bf16', 'nncp'),
 ]
