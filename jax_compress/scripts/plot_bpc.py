@@ -55,17 +55,29 @@ XL_DATA = [
     (100_000_000, 1.3734, 'enwik8', 'bf16', 'nncp'),
 ]
 
-# JAX reference points (from the jax-compress README)
+# JAX reference points (from Byron Knoll's jax-compress README)
+#   enwik8: 15,505,441 bytes -> 1.2404 bpc (no preprocessing dict).
+#   enwik9: 113,393,442 bytes compressed + 80,040 byte dict = 113,473,482 bytes
+#          -> 0.9078 bpc total. (An earlier version of this list had 0.9114
+#          which was an arithmetic error on my part.)
 JAX_REF = [
-    (100_000_000, 1.2404, 'jax enwik8'),
-    (1_000_000_000, 0.9114, 'jax enwik9'),  # 113,393,442 / 1e9 * 8
+    (100_000_000, 1.2404, 'jax-compress enwik8'),
+    (1_000_000_000, 0.9078, 'jax-compress enwik9'),
 ]
 
-# NNCP v2 reference (Bellard 2021, base config) -- the bar we want to beat.
-# enwik8: ~9 hours on RTX 3090, fp16. Approximate published bpc.
+# NNCP reference points -- LTCB-verified (Mahoney's Large Text Compression
+# Benchmark, http://mattmahoney.net/dc/text.html). NNCP v2.1 is the version
+# vendored at jax_compress/nncp/preprocess.c, released 2021-02-06.
+#   nncp v2.1 enwik8: 15,020,691 bytes -> 1.2017 bpc (compressed file only).
+#   nncp v2.1 enwik9: 112,219,309 bytes (compressed) + 100,046 bytes dict
+#                    = 112,319,355 bytes total. The 0.8978 bpc figure used
+#                    here is compressed-only, matching the convention used
+#                    for our own runs in HYBRID_DATA / XL_DATA / DATA.
+# Earlier "NNCP-base ~1.0 bpc" approximations (commit e2cdbb4) were simply
+# wrong -- LTCB has no version of NNCP at ~1.0 bpc on enwik8.
 NNCP_REF = [
-    (100_000_000, 1.0066, 'nncp-base enwik8'),  # Bellard reports ~1.0 bpc base
-    (1_000_000_000, 0.9943, 'nncp-base enwik9'),  # ~0.99 bpc base config
+    (100_000_000, 1.2017, 'nncp v2.1 enwik8'),
+    (1_000_000_000, 0.8978, 'nncp v2.1 enwik9'),
 ]
 
 # Hybrid backend (model_type=hybrid -- LSTM + Transformer-XL geometric-mean
@@ -156,14 +168,14 @@ def _plot_hybrid_mixer(ax):
 def _plot_refs(ax):
     if JAX_REF:
         xs, ys, ls = zip(*JAX_REF)
-        ax.plot(xs, ys, '^--', color='#2ca02c', label='jax (bf16, reference)',
+        ax.plot(xs, ys, '^--', color='#2ca02c', label='jax-compress (Knoll, reference)',
                 markersize=8, alpha=0.7)
         for x, y, l in JAX_REF:
             ax.annotate(l, (x, y), textcoords='offset points', xytext=(-8, -14),
                         fontsize=9, color='#2ca02c')
     if NNCP_REF:
         xs, ys, ls = zip(*NNCP_REF)
-        ax.plot(xs, ys, 'v--', color='#9467bd', label='nncp-base (fp16, reference)',
+        ax.plot(xs, ys, 'v--', color='#9467bd', label='nncp v2.1 (LTCB, reference)',
                 markersize=8, alpha=0.7)
         for x, y, l in NNCP_REF:
             ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, -14),
