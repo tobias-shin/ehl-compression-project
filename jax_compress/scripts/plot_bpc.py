@@ -83,6 +83,20 @@ HYBRID_DATA = [
     (100_000_000, 1.2723, 'enwik8', 'bf16', 'nncp'),
 ]
 
+# Hybrid + learned mixer (model_type=hybrid + --use-learned-mixer). Tiny MLP
+# (~320 params) produces per-step softmax weights from per-submodel
+# confidence features (entropy + max log-prob). Equal-weight ensemble is in
+# the mixer's hypothesis class so it can never be strictly worse than
+# HYBRID_DATA at convergence; should win modestly at every scale and more
+# meaningfully where one submodel is much better than the other.
+HYBRID_MIXER_DATA = [
+    # (    10_000, ?, 'enwik4', 'fp32', 'none'),
+    # (   100_000, ?, 'enwik5', 'fp32', 'nncp'),
+    # ( 1_000_000, ?, 'enwik6', 'fp32', 'nncp'),
+    # (10_000_000, ?, 'enwik7', 'fp32', 'nncp'),
+    # (100_000_000, ?, 'enwik8', 'bf16', 'nncp'),
+]
+
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_PATH = os.path.normpath(os.path.join(THIS_DIR, '..', 'data', 'bpc_vs_size.png'))
 
@@ -119,11 +133,23 @@ def _plot_hybrid(ax):
     hyb_pts = _dedup_pts(HYBRID_DATA)
     if hyb_pts:
         xs, ys, ls = zip(*hyb_pts)
-        ax.plot(xs, ys, '*-', color='#8c564b', label='torch hybrid (LSTM + xl)',
+        ax.plot(xs, ys, '*-', color='#8c564b', label='torch hybrid (LSTM + xl, equal-weight)',
                 markersize=12)
         for x, y, l in hyb_pts:
             ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, 6),
                         fontsize=9, color='#8c564b')
+
+
+def _plot_hybrid_mixer(ax):
+    pts = _dedup_pts(HYBRID_MIXER_DATA)
+    if pts:
+        xs, ys, ls = zip(*pts)
+        ax.plot(xs, ys, 's-', color='#e377c2',
+                label='torch hybrid (LSTM + xl, learned mixer)',
+                markersize=8)
+        for x, y, l in pts:
+            ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, -14),
+                        fontsize=9, color='#e377c2')
 
 
 def _plot_refs(ax):
@@ -160,8 +186,9 @@ def main():
     _plot_lstm(ax)
     _plot_transformer_xl(ax)
     _plot_hybrid(ax)
+    _plot_hybrid_mixer(ax)
     _plot_refs(ax)
-    _format_axis(ax, 'Compression rate vs file size — torch_compress (LSTM, Transformer-XL, Hybrid)')
+    _format_axis(ax, 'Compression rate vs file size — torch_compress')
     fig.tight_layout()
     fig.savefig(OUT_PATH, dpi=140)
     print(f'wrote {OUT_PATH}')
