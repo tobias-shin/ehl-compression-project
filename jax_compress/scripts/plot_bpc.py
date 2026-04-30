@@ -76,7 +76,11 @@ HYBRID_DATA = [
     (   100_000, 2.8269, 'enwik5', 'fp32', 'nncp'),
     ( 1_000_000, 2.0909, 'enwik6', 'fp32', 'nncp'),
     (10_000_000, 1.6465, 'enwik7', 'fp32', 'nncp'),
-    # (100_000_000, ?, 'enwik8', 'bf16', 'nncp'),
+    # enwik8 hybrid: 14h 16min, --use-bf16 --mode compress, default hparams.
+    # First size at which the hybrid beats the LSTM solo (1.27 vs 1.29).
+    # Round-trip not verified (--mode compress); trust extrapolated from
+    # enwik4-6 hybrid round-trip md5 matches.
+    (100_000_000, 1.2723, 'enwik8', 'bf16', 'nncp'),
 ]
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
