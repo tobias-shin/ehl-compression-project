@@ -274,4 +274,35 @@ print(f"  Second encode: {len(compressed_hyb_b)} bytes, sha={hash(compressed_hyb
 assert compressed_hyb == compressed_hyb_b, "hybrid encodes are NOT deterministic"
 print("  PASS: bit-identical encode across processes (hybrid)")
 
+
+# ---- hybrid + learned mixer backend -------------------------------------
+# Same as the equal-weight hybrid but with use_learned_mixer = True. The
+# mixer is a tiny MLP that takes per-submodel confidence features (entropy
+# + max log-prob) and outputs softmax weights. Equal-weight is in its
+# hypothesis class (uniform weights), so the mixer can never be strictly
+# worse than the equal-weight hybrid at convergence. Trained online via the
+# same AC cross-entropy that trains the submodels.
+HYBRID_MIX_HPARAMS = HYBRID_HPARAMS + 'use_learned_mixer = True\n'
+
+# ---- Test 9: hybrid + learned mixer round-trip --------------------------
+print("\n== Test 9: hybrid + learned mixer round-trip with retrain ==")
+ns_mix = load_namespace(os.path.join(REPO, "torch_compress.ipynb"), HYBRID_MIX_HPARAMS)
+compressed_mix = encode(ns_mix, DATA, VOCAB)
+print(f"  Encoded {len(DATA)} symbols -> {len(compressed_mix)} bytes")
+decoded_mix = decode(ns_mix, compressed_mix, len(DATA), VOCAB)
+assert decoded_mix == DATA, (
+    f"hybrid+mixer round-trip is broken: decoded[:10]={decoded_mix[:10]} "
+    f"!= expected[:10]={DATA[:10]}"
+)
+print("  PASS: hybrid+mixer round-trip is lossless")
+
+# ---- Test 10: hybrid + learned mixer determinism ------------------------
+print("\n== Test 10: hybrid + learned mixer determinism ==")
+ns_mix2 = load_namespace(os.path.join(REPO, "torch_compress.ipynb"), HYBRID_MIX_HPARAMS)
+compressed_mix_b = encode(ns_mix2, DATA, VOCAB)
+print(f"  First encode:  {len(compressed_mix)} bytes, sha={hash(compressed_mix)}")
+print(f"  Second encode: {len(compressed_mix_b)} bytes, sha={hash(compressed_mix_b)}")
+assert compressed_mix == compressed_mix_b, "hybrid+mixer encodes are NOT deterministic"
+print("  PASS: bit-identical encode across processes (hybrid+mixer)")
+
 print("\nALL TESTS PASS")

@@ -262,7 +262,20 @@ def build_model(model_type, *, vocab_size, embedding_size, rnn_units, num_layers
         init_std=g.get('init_std', 0.02),
     )
     from models.hybrid import HybridModel
-    return HybridModel(lstm, xl)
+    # Optional learned mixer (cmix-style context-dependent gating). When the
+    # `use_learned_mixer` notebook global is True, attach a tiny MLP that
+    # produces per-step weights from per-submodel confidence features
+    # (entropy + max log-prob). When False, HybridModel.mixer is None and
+    # the ensemble loop falls back to equal-weight geometric mean.
+    mixer = None
+    if g.get('use_learned_mixer', False):
+      from models.learned_mixer import LearnedMixer
+      mixer = LearnedMixer(
+          n_models=2,
+          hidden_dim=g.get('mixer_hidden_dim', 64),
+          init_std=g.get('mixer_init_std', 0.02),
+      )
+    return HybridModel(lstm, xl, mixer=mixer)
   raise ValueError(f"unknown model_type: {model_type!r}")
 '''
 
@@ -1217,14 +1230,26 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
   xl_retrain_opt = torch.optim.Adam(
       model.transformer_xl.parameters(), lr=1.0, betas=(adam_b1, adam_b2), eps=adam_eps)
 
+  # Optional learned mixer optimizer. The mixer is tiny (~300 params) so it
+  # can take a much higher LR than the submodels; defaults to 0.01 unless
+  # overridden via mixer_lr global.
+  mixer_opt = None
+  if model.mixer is not None:
+    mixer_lr = globals().get('mixer_lr', 0.01)
+    mixer_opt = torch.optim.Adam(
+        model.mixer.parameters(), lr=mixer_lr, betas=(adam_b1, adam_b2), eps=adam_eps)
+
   total_params = sum(p.numel() for p in model.parameters())
   lstm_params = sum(p.numel() for p in model.lstm.parameters())
   xl_params = sum(p.numel() for p in model.transformer_xl.parameters())
+  mixer_params = sum(p.numel() for p in model.mixer.parameters()) if model.mixer is not None else 0
   print("\\n" + "=" * 80)
-  print(f"Hybrid LSTM + Transformer-XL")
+  print(f"Hybrid LSTM + Transformer-XL" + (" + LearnedMixer" if model.mixer is not None else ""))
   print("=" * 80)
   print(f"LSTM submodel parameters:           {lstm_params:,}")
   print(f"Transformer-XL submodel parameters: {xl_params:,}")
+  if model.mixer is not None:
+    print(f"LearnedMixer parameters:            {mixer_params:,}")
   print(f"Total parameters:                   {total_params:,}")
   print("=" * 80 + "\\n")
 
@@ -1326,11 +1351,19 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
           xl_seq_input, xl_mems, return_sequence=False, deterministic=True)
     xl_logits = xl_logits.float()
 
-    # ---- Combine: geometric-mean ensemble in log-prob space ----
+    # ---- Combine: equal-weight or learned-mixer geometric mean ----
     log_probs_lstm = F.log_softmax(lstm_logits, dim=-1)
     log_probs_xl = F.log_softmax(xl_logits, dim=-1)
-    mean_log_probs = 0.5 * (log_probs_lstm + log_probs_xl)
-    probs = F.softmax(mean_log_probs, dim=-1).detach().cpu().numpy()
+    if model.mixer is not None:
+      # Learned mixer: per-step softmax weights from confidence features.
+      # Output is generally unnormalised; log_softmax it to get a valid
+      # log-prob distribution for the AC.
+      combined_unnorm = model.mixer([log_probs_lstm, log_probs_xl])
+      combined_log_probs = F.log_softmax(combined_unnorm, dim=-1)
+    else:
+      # Equal-weight geometric mean (the original hybrid behaviour).
+      combined_log_probs = 0.5 * (log_probs_lstm + log_probs_xl)
+    probs = F.softmax(combined_log_probs, dim=-1).detach().cpu().numpy()
 
     # ---- Drive the AC: one symbol per parallel stream ----
     current_symbols = []
@@ -1345,29 +1378,44 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
     symbols_t = torch.tensor(current_symbols, dtype=torch.long, device=device)
     mask_t = torch.tensor(current_mask, dtype=torch.float32, device=device)
 
-    # ---- Backward: each submodel against the actual symbol, independently ----
-    # LSTM backward
+    # ---- Backward ----
+    # Each submodel always gets gradient from its own solo loss (so each
+    # learns to be a competent solo predictor regardless of the mixer).
+    # If a learned mixer is in play, an additional ensemble-loss term is
+    # added: cross-entropy of the mixer's combined distribution against the
+    # actual symbol. Gradient from the mixer-loss flows through the mixer
+    # AND back through the submodels, so they co-adapt to be good ensemble
+    # components in addition to good solos.
     lstm_opt.zero_grad()
-    lstm_loss_per = F.cross_entropy(lstm_logits, symbols_t, reduction='none')
-    lstm_loss = (lstm_loss_per * mask_t).sum()
-    lstm_loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.lstm.parameters(), 4.0)
-    lstm_opt.step()
-
-    # Transformer-XL backward
     xl_opt.zero_grad()
-    xl_loss_per = F.cross_entropy(xl_logits, symbols_t, reduction='none')
-    xl_loss = (xl_loss_per * mask_t).sum()
-    xl_loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.transformer_xl.parameters(), 4.0)
-    xl_opt.step()
+    if mixer_opt is not None:
+      mixer_opt.zero_grad()
 
-    # ---- Compute ensemble cross-entropy for logging (using detached log_probs) ----
-    log_probs_lstm_d = F.log_softmax(lstm_logits.detach(), dim=-1)
-    log_probs_xl_d = F.log_softmax(xl_logits.detach(), dim=-1)
-    mean_log_probs_d = 0.5 * (log_probs_lstm_d + log_probs_xl_d)
+    lstm_loss_per = F.cross_entropy(lstm_logits, symbols_t, reduction='none')
+    xl_loss_per = F.cross_entropy(xl_logits, symbols_t, reduction='none')
+    total_loss = (lstm_loss_per * mask_t).sum() + (xl_loss_per * mask_t).sum()
+
+    if model.mixer is not None:
+      # NLL of combined log-probs against actual symbol, masked.
+      nll_per = -combined_log_probs.gather(1, symbols_t.unsqueeze(1)).squeeze(1)
+      total_loss = total_loss + (nll_per * mask_t).sum()
+
+    total_loss.backward()
+    # Clip each component's grads to its own norm budget.
+    torch.nn.utils.clip_grad_norm_(model.lstm.parameters(), 4.0)
+    torch.nn.utils.clip_grad_norm_(model.transformer_xl.parameters(), 4.0)
+    if model.mixer is not None:
+      torch.nn.utils.clip_grad_norm_(model.mixer.parameters(), 4.0)
+    lstm_opt.step()
+    xl_opt.step()
+    if mixer_opt is not None:
+      mixer_opt.step()
+
+    # ---- Compute ensemble cross-entropy for logging (against AC's distribution) ----
+    # Use the *same* combined_log_probs the AC saw (detached) so the running
+    # average matches the realised bpc the AC is producing.
     one_hot = F.one_hot(symbols_t, num_classes=vocab_size).float()
-    loss_vals = -(one_hot * F.log_softmax(mean_log_probs_d, dim=-1)).sum(dim=-1)
+    loss_vals = -(one_hot * combined_log_probs.detach()).sum(dim=-1)
     cross_entropy += (loss_vals * mask_t).sum().item()
     denom += mask_t.sum().item()
 

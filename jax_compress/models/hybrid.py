@@ -21,7 +21,7 @@ import torch.nn as nn
 
 
 class HybridModel(nn.Module):
-    def __init__(self, lstm, transformer_xl):
+    def __init__(self, lstm, transformer_xl, mixer=None):
         super().__init__()
         assert lstm.vocab_size == transformer_xl.vocab_size, (
             f"vocab_size mismatch: LSTM={lstm.vocab_size}, "
@@ -31,4 +31,9 @@ class HybridModel(nn.Module):
         )
         self.lstm = lstm
         self.transformer_xl = transformer_xl
+        # Optional learned mixer. When None, the calling loop
+        # (_process_hybrid) falls back to equal-weight geometric mean. When
+        # set, the loop calls mixer(log_probs_list) to produce the combined
+        # distribution and includes mixer params in its optimizer.
+        self.mixer = mixer
         self.vocab_size = lstm.vocab_size

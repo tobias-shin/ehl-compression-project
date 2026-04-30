@@ -195,6 +195,8 @@ retrain_mem_len = {args.retrain_mem_len}
 learning_rate_schedule_xl = "{args.xl_lr_schedule}"
 retrain_lr_schedule_xl = "{args.xl_retrain_lr_schedule}"
 use_bf16 = {bool(args.use_bf16)}
+use_learned_mixer = {bool(args.use_learned_mixer)}
+mixer_lr = {args.mixer_lr}
 """
 
 
@@ -272,6 +274,11 @@ def main():
     ap.add_argument('--use-bf16', dest='use_bf16', action='store_true')
     ap.add_argument('--no-bf16', dest='use_bf16', action='store_false')
     ap.set_defaults(use_bf16=False)
+    # ---- Hybrid learned mixer ---------------------------------------------
+    ap.add_argument('--use-learned-mixer', action='store_true',
+                    help="enable cmix-style learned gating mixer (only used "
+                         "when --model-type is hybrid)")
+    ap.add_argument('--mixer-lr', type=float, default=0.01)
     args = ap.parse_args()
     if args.no_retrain:
         args.retrain_period = "0:1000000000"

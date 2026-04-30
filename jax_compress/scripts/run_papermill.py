@@ -113,6 +113,16 @@ def main():
                     help='step-units schedule for retrain period. Notebook '
                          'default "0:1001 200000:5001". NNCP-base equivalent '
                          'with batch_size=64: "0:7813".')
+    # ---- Hybrid learned mixer (only used when model_type == "hybrid") ----
+    ap.add_argument("--use-learned-mixer", action="store_true",
+                    help="enable the cmix-style learned gating mixer; tiny "
+                         "MLP outputs per-step weights from per-submodel "
+                         "confidence features. equal-weight ensemble is in "
+                         "the mixer's hypothesis class so it can't degrade "
+                         "below it at convergence.")
+    ap.add_argument("--mixer-lr", type=float, default=0.01,
+                    help="LR for the learned mixer's Adam optimizer "
+                         "(separate from submodel LR schedules).")
     args = ap.parse_args()
 
     prepared = args.output_nb + ".prepared.ipynb"
@@ -162,6 +172,9 @@ def main():
     if args.retrain_block_len is not None: params["retrain_block_len"] = args.retrain_block_len
     if args.retrain_batch_size is not None: params["retrain_batch_size"] = args.retrain_batch_size
     if args.retrain_period_schedule is not None: params["retrain_period_schedule"] = args.retrain_period_schedule
+    # Hybrid learned mixer (no-op unless model_type=="hybrid")
+    params["use_learned_mixer"] = bool(args.use_learned_mixer)
+    params["mixer_lr"] = args.mixer_lr
 
     print(f"[run_papermill] input={args.input} use_bf16={args.use_bf16} preprocess={args.preprocess}")
     print(f"[run_papermill] tb_run_name={args.tb_run_name}")
