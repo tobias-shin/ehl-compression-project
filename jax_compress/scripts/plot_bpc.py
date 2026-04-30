@@ -93,7 +93,8 @@ HYBRID_MIXER_DATA = [
     (    10_000, 3.6656, 'enwik4', 'fp32', 'none'),
     (   100_000, 2.6597, 'enwik5', 'fp32', 'nncp'),
     ( 1_000_000, 1.9934, 'enwik6', 'fp32', 'nncp'),
-    # (10_000_000, ?, 'enwik7', 'fp32', 'nncp'),
+    # enwik7: --mode compress only; round-trip md5 verified at enwik4-6.
+    (10_000_000, 1.6018, 'enwik7', 'fp32', 'nncp'),
     # (100_000_000, ?, 'enwik8', 'bf16', 'nncp'),
 ]
 
