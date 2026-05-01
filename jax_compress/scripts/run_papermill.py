@@ -123,6 +123,12 @@ def main():
     ap.add_argument("--mixer-lr", type=float, default=0.01,
                     help="LR for the learned mixer's Adam optimizer "
                          "(separate from submodel LR schedules).")
+    ap.add_argument("--clip-xl", type=float, default=None,
+                    help="grad-norm clip for the Transformer-XL path "
+                         "(default 0.25, NNCP-aligned).")
+    ap.add_argument("--adam-eps-xl", type=float, default=None,
+                    help="Adam epsilon for the Transformer-XL path "
+                         "(default 1e-9, NNCP-aligned).")
     args = ap.parse_args()
 
     prepared = args.output_nb + ".prepared.ipynb"
@@ -175,6 +181,8 @@ def main():
     # Hybrid learned mixer (no-op unless model_type=="hybrid")
     params["use_learned_mixer"] = bool(args.use_learned_mixer)
     params["mixer_lr"] = args.mixer_lr
+    if args.clip_xl is not None: params["clip_xl"] = args.clip_xl
+    if args.adam_eps_xl is not None: params["adam_eps_xl"] = args.adam_eps_xl
 
     print(f"[run_papermill] input={args.input} use_bf16={args.use_bf16} preprocess={args.preprocess}")
     print(f"[run_papermill] tb_run_name={args.tb_run_name}")

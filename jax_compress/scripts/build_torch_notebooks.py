@@ -396,10 +396,14 @@ def forward_ensemble(models, inputs, states_per_model):
   return probs, logits_list, new_states_per_model
 
 
-def backward_and_step(logits_list, optimizers, models, symbols, mask, vocab_size):
+def backward_and_step(logits_list, optimizers, models, symbols, mask, vocab_size,
+                      clip=4.0):
   """Cross-entropy backward + gradient clip + optimizer step for every ensemble member.
 
   Returns the geometric-mean ensemble loss (scalar) and the mask sum (denominator).
+
+  ``clip`` defaults to 4.0 (torch_compress's tuned value for the LSTM); the
+  Transformer-XL streaming path passes clip=clip_xl (NNCP-aligned 0.25).
   """
   log_probs_list = []
   for logits, optimizer, model in zip(logits_list, optimizers, models):
@@ -407,7 +411,7 @@ def backward_and_step(logits_list, optimizers, models, symbols, mask, vocab_size
     loss_per = F.cross_entropy(logits, symbols, reduction='none')
     loss = (loss_per * mask).sum()
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 4.0)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
     optimizer.step()
     log_probs_list.append(F.log_softmax(logits.detach(), dim=-1))
 
@@ -862,6 +866,8 @@ def _process_transformer_xl(compress, length, vocab_size, coder, data):
   optimizers = []
   retrain_optimizers = []
   initial_lr = lr_schedule[0][1] if lr_schedule else 5e-4
+  # NNCP-aligned Adam epsilon (1e-9 vs torch_compress's tuned 1e-12 for LSTM).
+  _adam_eps_xl = float(globals().get('adam_eps_xl', 1e-9))
   for _ in range(ensemble_size):
     m = build_model('transformer_xl',
                     vocab_size=vocab_size, embedding_size=embedding_size,
@@ -869,12 +875,12 @@ def _process_transformer_xl(compress, length, vocab_size, coder, data):
                     dropout_rate=0.0).to(device)
     models.append(m)
     optimizers.append(torch.optim.Adam(
-        m.parameters(), lr=initial_lr, betas=(adam_b1, adam_b2), eps=adam_eps))
+        m.parameters(), lr=initial_lr, betas=(adam_b1, adam_b2), eps=_adam_eps_xl))
     # Separate optimizer state for retraining, mirroring NNCP's saved-state
     # toggle and torch_compress's two-optimizer pattern. lr is overwritten
     # per-step inside the retrain function.
     retrain_optimizers.append(torch.optim.Adam(
-        m.parameters(), lr=1.0, betas=(adam_b1, adam_b2), eps=adam_eps))
+        m.parameters(), lr=1.0, betas=(adam_b1, adam_b2), eps=_adam_eps_xl))
 
   total_params = sum(p.numel() for p in models[0].parameters()) * ensemble_size
   print("\\n" + "=" * 80)
@@ -989,8 +995,10 @@ def _process_transformer_xl(compress, length, vocab_size, coder, data):
     mask_t = torch.tensor(current_mask, dtype=torch.float32, device=device)
 
     # Reuse the LSTM-side helper — same per-step loss/clip/step shape.
+    # NNCP-aligned: pass clip_xl (default 0.25) instead of the LSTM's 4.0.
     loss_val, loss_denom = backward_and_step(
-        logits_list, optimizers, models, symbols_t, mask_t, vocab_size)
+        logits_list, optimizers, models, symbols_t, mask_t, vocab_size,
+        clip=float(globals().get('clip_xl', 0.25)))
     cross_entropy += loss_val
     denom += loss_denom
 
@@ -1129,7 +1137,9 @@ def _retrain_transformer_xl(*, models, retrain_optimizers, current_lr, file_data
             reduction='mean',
         )
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 4.0)
+        # NNCP-aligned clip (0.25) for the transformer retrain pass.
+        torch.nn.utils.clip_grad_norm_(model.parameters(),
+            float(globals().get('clip_xl', 0.25)))
         for g in optimizer.param_groups:
           g['lr'] = current_lr
         optimizer.step()
@@ -1220,15 +1230,19 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
                       rnn_units=rnn_units, num_layers=num_layers,
                       dropout_rate=retrain_dropout).to(device)
 
+  # LSTM half keeps torch_compress's tuned adam_eps; Transformer-XL half
+  # uses NNCP-aligned adam_eps_xl. Mixer keeps adam_eps (the LSTM-side value
+  # is fine for a tiny gating MLP).
+  _adam_eps_xl = float(globals().get('adam_eps_xl', 1e-9))
   lstm_opt = torch.optim.Adam(
       model.lstm.parameters(), lr=initial_lstm_lr, betas=(adam_b1, adam_b2), eps=adam_eps)
   xl_opt = torch.optim.Adam(
-      model.transformer_xl.parameters(), lr=initial_xl_lr, betas=(adam_b1, adam_b2), eps=adam_eps)
+      model.transformer_xl.parameters(), lr=initial_xl_lr, betas=(adam_b1, adam_b2), eps=_adam_eps_xl)
   # Separate retrain optimizer state per submodel (lr=1.0 placeholder; per-step set).
   lstm_retrain_opt = torch.optim.Adam(
       model.lstm.parameters(), lr=1.0, betas=(adam_b1, adam_b2), eps=adam_eps)
   xl_retrain_opt = torch.optim.Adam(
-      model.transformer_xl.parameters(), lr=1.0, betas=(adam_b1, adam_b2), eps=adam_eps)
+      model.transformer_xl.parameters(), lr=1.0, betas=(adam_b1, adam_b2), eps=_adam_eps_xl)
 
   # Optional learned mixer optimizer. The mixer is tiny (~300 params) so it
   # can take a much higher LR than the submodels; defaults to 0.01 unless
@@ -1401,9 +1415,12 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
       total_loss = total_loss + (nll_per * mask_t).sum()
 
     total_loss.backward()
-    # Clip each component's grads to its own norm budget.
+    # Per-component clip budgets: LSTM keeps torch_compress's 4.0; the
+    # Transformer-XL half uses NNCP-aligned clip_xl (0.25); the mixer is
+    # tiny so a generous 4.0 is fine.
+    _clip_xl = float(globals().get('clip_xl', 0.25))
     torch.nn.utils.clip_grad_norm_(model.lstm.parameters(), 4.0)
-    torch.nn.utils.clip_grad_norm_(model.transformer_xl.parameters(), 4.0)
+    torch.nn.utils.clip_grad_norm_(model.transformer_xl.parameters(), _clip_xl)
     if model.mixer is not None:
       torch.nn.utils.clip_grad_norm_(model.mixer.parameters(), 4.0)
     lstm_opt.step()
@@ -1605,9 +1622,15 @@ retrain_mem_len = 128 #@param {type:"integer"}
 #@markdown _The model is constructed with `dropout`, but streaming forward passes use `deterministic=True` (eval mode, dropout off). Dropout activates only during retraining (`deterministic=False`, train mode). `retrain_tgt_len` and `retrain_mem_len` are NNCP's retrain-time shape — `model.reset_length()` swaps these in around each retrain pass and restores the streaming shape (1, 0, mem_len) afterward._
 
 #@markdown ---
-#@markdown _Transformer-XL learning-rate schedules. The streaming and retraining LRs default to NNCP-base's values (`nncp_enwik_base.sh`). When `model_type == "transformer_xl"`, `_process_transformer_xl` reads these schedules instead of `learning_rate_schedule` / `retrain_lr_schedule` (which stay tuned for the LSTM)._
-learning_rate_schedule_xl = "0:7.9e-5 341105:1.6e-5 3134681:5.0e-6" #@param {type:"string"}
+#@markdown _Transformer-XL learning-rate schedules. NNCP's published schedule (`nncp_enwik_base.sh`) was tuned for enwik9 at batch_size=64 -> ~1.5M streaming steps, with the first decay at 341K (~23% into the run). Our enwik8 runs at batch_size=128 do only ~202K steps, so NNCP's 341K transition would never fire. The default below pulls the transition to step 50K (~25% of a 200K-step run) and the second to 150K (~75%) so the LR actually decays during enwik8._
+learning_rate_schedule_xl = "0:7.9e-5 50000:1.6e-5 150000:5.0e-6" #@param {type:"string"}
 retrain_lr_schedule_xl = "0:4.0e-4 13000:2.0e-4 93000:1.0e-4 163000:5.0e-5 1911300:1.6e-5" #@param {type:"string"}
+
+#@markdown ---
+#@markdown ### Transformer-XL optimizer hparams (NNCP-aligned)
+#@markdown _Used by `_process_transformer_xl` and the transformer half of `_process_hybrid`. NNCP-base uses `clip=0.25` (vs torch_compress's tuned 4.0 for the LSTM) and `adam_eps=1e-9` (vs torch_compress's 1e-12). Closer alignment with NNCP's published config._
+clip_xl = 0.25 #@param {type:"number"}
+adam_eps_xl = 1e-9 #@param {type:"number"}
 '''
 params_src = ''.join(nb['cells'][3]['source']) + PARAMS_TB_APPEND
 nb['cells'][3] = code_cell(params_src, tags=["parameters"])
