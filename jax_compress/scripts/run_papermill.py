@@ -123,6 +123,11 @@ def main():
     ap.add_argument("--mixer-lr", type=float, default=0.01,
                     help="LR for the learned mixer's Adam optimizer "
                          "(separate from submodel LR schedules).")
+    ap.add_argument("--use-xl-small-submodel", action="store_true",
+                    help="add a small Transformer-XL (n_layer=4, d_model=256, "
+                         "mem_len=64) as a 3rd submodel in the hybrid. "
+                         "Tests whether the mixer can use a same-architecture "
+                         "3rd component productively.")
     ap.add_argument("--clip-xl", type=float, default=None,
                     help="grad-norm clip for the Transformer-XL path "
                          "(default 0.25, NNCP-aligned).")
@@ -183,6 +188,7 @@ def main():
     params["mixer_lr"] = args.mixer_lr
     if args.clip_xl is not None: params["clip_xl"] = args.clip_xl
     if args.adam_eps_xl is not None: params["adam_eps_xl"] = args.adam_eps_xl
+    params["use_xl_small_submodel"] = bool(args.use_xl_small_submodel)
 
     print(f"[run_papermill] input={args.input} use_bf16={args.use_bf16} preprocess={args.preprocess}")
     print(f"[run_papermill] tb_run_name={args.tb_run_name}")

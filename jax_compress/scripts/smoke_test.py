@@ -305,4 +305,38 @@ print(f"  Second encode: {len(compressed_mix_b)} bytes, sha={hash(compressed_mix
 assert compressed_mix == compressed_mix_b, "hybrid+mixer encodes are NOT deterministic"
 print("  PASS: bit-identical encode across processes (hybrid+mixer)")
 
+
+# ---- 3-submodel hybrid: LSTM + big-XL + small-XL + learned mixer ----
+# Tiny config so the test stays fast on CPU. Tests that the hybrid can
+# accept a 3rd component without breaking round-trip or determinism.
+HYBRID_3MODEL_HPARAMS = HYBRID_MIX_HPARAMS + """
+use_xl_small_submodel = True
+xl_small_n_layer = 2
+xl_small_n_head = 2
+xl_small_d_model = 16
+xl_small_d_head = 8
+xl_small_d_inner = 32
+xl_small_mem_len = 4
+xl_small_ext_tgt_len = 2
+"""
+
+print("\n== Test 11: hybrid (3 submodels) + learned mixer round-trip ==")
+ns_3 = load_namespace(os.path.join(REPO, "torch_compress.ipynb"), HYBRID_3MODEL_HPARAMS)
+compressed_3 = encode(ns_3, DATA, VOCAB)
+print(f"  Encoded {len(DATA)} symbols -> {len(compressed_3)} bytes")
+decoded_3 = decode(ns_3, compressed_3, len(DATA), VOCAB)
+assert decoded_3 == DATA, (
+    f"3-submodel hybrid round-trip is broken: decoded[:10]={decoded_3[:10]} "
+    f"!= expected[:10]={DATA[:10]}"
+)
+print("  PASS: 3-submodel hybrid round-trip is lossless")
+
+print("\n== Test 12: hybrid (3 submodels) + learned mixer determinism ==")
+ns_3b = load_namespace(os.path.join(REPO, "torch_compress.ipynb"), HYBRID_3MODEL_HPARAMS)
+compressed_3b = encode(ns_3b, DATA, VOCAB)
+print(f"  First encode:  {len(compressed_3)} bytes, sha={hash(compressed_3)}")
+print(f"  Second encode: {len(compressed_3b)} bytes, sha={hash(compressed_3b)}")
+assert compressed_3 == compressed_3b, "3-submodel hybrid encodes are NOT deterministic"
+print("  PASS: bit-identical encode across processes (3 submodels)")
+
 print("\nALL TESTS PASS")

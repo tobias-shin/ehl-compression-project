@@ -262,6 +262,32 @@ def build_model(model_type, *, vocab_size, embedding_size, rnn_units, num_layers
         init_std=g.get('init_std', 0.02),
     )
     from models.hybrid import HybridModel
+
+    # Optional 3rd submodel: a smaller Transformer-XL. Tests whether the
+    # mixer benefits from a 3rd component when that component is the same
+    # architecture family (just smaller / shorter mem_len) -- if even this
+    # gives bpc lift, scaffolding works and structurally-different 3rd
+    # models become the natural next experiment.
+    xl_small = None
+    if g.get('use_xl_small_submodel', False):
+      xl_small = TransformerXLModel(
+          vocab_size=vocab_size,
+          n_layer=g.get('xl_small_n_layer', 4),
+          n_head=g.get('xl_small_n_head', 8),
+          d_model=g.get('xl_small_d_model', 256),
+          d_head=g.get('xl_small_d_head', 32),
+          d_inner=g.get('xl_small_d_inner', 1024),
+          dropout=g.get('dropout', 0.0),
+          dropatt=g.get('dropatt', 0.0),
+          tgt_len=1,
+          ext_len=g.get('xl_small_ext_tgt_len', 15),
+          mem_len=g.get('xl_small_mem_len', 64),
+          attn_type=g.get('attn_type', 1),
+          tied_r_bias=g.get('tied_r_bias', True),
+          use_gelu=g.get('use_gelu', True),
+          init_std=g.get('init_std', 0.02),
+      )
+
     # Optional learned mixer (cmix-style context-dependent gating). When the
     # `use_learned_mixer` notebook global is True, attach a tiny MLP that
     # produces per-step weights from per-submodel confidence features
@@ -270,12 +296,13 @@ def build_model(model_type, *, vocab_size, embedding_size, rnn_units, num_layers
     mixer = None
     if g.get('use_learned_mixer', False):
       from models.learned_mixer import LearnedMixer
+      n_models = 2 + (1 if xl_small is not None else 0)
       mixer = LearnedMixer(
-          n_models=2,
+          n_models=n_models,
           hidden_dim=g.get('mixer_hidden_dim', 64),
           init_std=g.get('mixer_init_std', 0.02),
       )
-    return HybridModel(lstm, xl, mixer=mixer)
+    return HybridModel(lstm, xl, transformer_xl_small=xl_small, mixer=mixer)
   raise ValueError(f"unknown model_type: {model_type!r}")
 '''
 
@@ -1238,6 +1265,18 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
       model.lstm.parameters(), lr=initial_lstm_lr, betas=(adam_b1, adam_b2), eps=adam_eps)
   xl_opt = torch.optim.Adam(
       model.transformer_xl.parameters(), lr=initial_xl_lr, betas=(adam_b1, adam_b2), eps=_adam_eps_xl)
+  # Optional 3rd submodel (small Transformer-XL): shares xl_lr_schedule and
+  # adam_eps_xl with the big one. If we want different hparams later, add
+  # `xl_small_lr_schedule` / `xl_small_adam_eps` notebook globals.
+  xl_small_opt = None
+  xl_small_retrain_opt = None
+  if model.transformer_xl_small is not None:
+    xl_small_opt = torch.optim.Adam(
+        model.transformer_xl_small.parameters(), lr=initial_xl_lr,
+        betas=(adam_b1, adam_b2), eps=_adam_eps_xl)
+    xl_small_retrain_opt = torch.optim.Adam(
+        model.transformer_xl_small.parameters(), lr=1.0,
+        betas=(adam_b1, adam_b2), eps=_adam_eps_xl)
   # Separate retrain optimizer state per submodel (lr=1.0 placeholder; per-step set).
   lstm_retrain_opt = torch.optim.Adam(
       model.lstm.parameters(), lr=1.0, betas=(adam_b1, adam_b2), eps=adam_eps)
@@ -1256,12 +1295,18 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
   total_params = sum(p.numel() for p in model.parameters())
   lstm_params = sum(p.numel() for p in model.lstm.parameters())
   xl_params = sum(p.numel() for p in model.transformer_xl.parameters())
+  xl_small_params = sum(p.numel() for p in model.transformer_xl_small.parameters()) if model.transformer_xl_small is not None else 0
   mixer_params = sum(p.numel() for p in model.mixer.parameters()) if model.mixer is not None else 0
+  arch_label = "Hybrid LSTM + Transformer-XL"
+  if model.transformer_xl_small is not None: arch_label += " + Transformer-XL(small)"
+  if model.mixer is not None: arch_label += " + LearnedMixer"
   print("\\n" + "=" * 80)
-  print(f"Hybrid LSTM + Transformer-XL" + (" + LearnedMixer" if model.mixer is not None else ""))
+  print(arch_label)
   print("=" * 80)
   print(f"LSTM submodel parameters:           {lstm_params:,}")
   print(f"Transformer-XL submodel parameters: {xl_params:,}")
+  if model.transformer_xl_small is not None:
+    print(f"Transformer-XL(small) parameters:   {xl_small_params:,}")
   if model.mixer is not None:
     print(f"LearnedMixer parameters:            {mixer_params:,}")
   print(f"Total parameters:                   {total_params:,}")
@@ -1274,18 +1319,21 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
   freq = np.cumsum(np.full(vocab_size, (1.0 / vocab_size)) * 10000000 + 1)
 
   qlen_xl = ext_tgt_len + 1  # Transformer streaming window
+  qlen_xl_small = (globals().get('xl_small_ext_tgt_len', 15) + 1
+                   if model.transformer_xl_small is not None else 0)
   # LSTM streaming window is `seq_length` (same param the LSTM solo path uses).
 
   initial_symbols = []
   for i in range(batch_size):
     initial_symbols.append(get_symbol(i * split, length, freq, coder, compress, data))
 
-  # Two seq_input windows -- LSTM consumes `seq_length` tokens per step (with
-  # BPTT), Transformer-XL consumes `qlen_xl = ext_tgt_len + 1`. They slide in
-  # lockstep but can be different widths.
+  # Per-submodel seq_input windows -- LSTM consumes `seq_length` tokens
+  # (with BPTT), Transformer-XL consumes qlen_xl, optional small-XL consumes
+  # qlen_xl_small. All slide in lockstep with the just-coded symbol.
   base = torch.tensor(initial_symbols, dtype=torch.long, device=device).unsqueeze(1)
   lstm_seq_input = base.repeat(1, seq_length)
   xl_seq_input = base.repeat(1, qlen_xl)
+  xl_small_seq_input = base.repeat(1, qlen_xl_small) if model.transformer_xl_small is not None else None
 
   def fresh_lstm_states():
     return model.lstm.init_states(batch_size, device)
@@ -1295,6 +1343,12 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
   xl_mems = model.transformer_xl.init_states(batch_size, device)
   if xl_mems is not None and ac_dtype != torch.float32:
     xl_mems = [t.to(ac_dtype) for t in xl_mems]
+
+  xl_small_mems = None
+  if model.transformer_xl_small is not None:
+    xl_small_mems = model.transformer_xl_small.init_states(batch_size, device)
+    if xl_small_mems is not None and ac_dtype != torch.float32:
+      xl_small_mems = [t.to(ac_dtype) for t in xl_small_mems]
 
   cross_entropy = 0.0
   denom = 0.0
@@ -1311,6 +1365,9 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
     current_xl_lr = get_scheduled_value(xl_lr_schedule, pos)
     for g in lstm_opt.param_groups: g['lr'] = current_lstm_lr
     for g in xl_opt.param_groups: g['lr'] = current_xl_lr
+    if xl_small_opt is not None:
+      # Small-XL shares the big-XL schedule unless we add a separate one later.
+      for g in xl_small_opt.param_groups: g['lr'] = current_xl_lr
 
     # Periodic retrain (both submodels retrain on the same retrain window in
     # their respective shapes). Mems / states are reset after retrain since
@@ -1352,6 +1409,10 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
       xl_mems = model.transformer_xl.init_states(batch_size, device)
       if xl_mems is not None and ac_dtype != torch.float32:
         xl_mems = [t.to(ac_dtype) for t in xl_mems]
+      if model.transformer_xl_small is not None:
+        xl_small_mems = model.transformer_xl_small.init_states(batch_size, device)
+        if xl_small_mems is not None and ac_dtype != torch.float32:
+          xl_small_mems = [t.to(ac_dtype) for t in xl_small_mems]
 
     # ---- Forward both submodels ----
     # LSTM: pop the oldest state from queue, BPTT replay over seq_length
@@ -1365,18 +1426,31 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
           xl_seq_input, xl_mems, return_sequence=False, deterministic=True)
     xl_logits = xl_logits.float()
 
+    # Optional small Transformer-XL: forward with its own mems
+    xl_small_logits = None
+    new_xl_small_mems = None
+    if model.transformer_xl_small is not None:
+      with torch.autocast(device_type=device.type, dtype=ac_dtype, enabled=use_bf16_flag):
+        xl_small_logits, new_xl_small_mems = model.transformer_xl_small(
+            xl_small_seq_input, xl_small_mems, return_sequence=False, deterministic=True)
+      xl_small_logits = xl_small_logits.float()
+
     # ---- Combine: equal-weight or learned-mixer geometric mean ----
     log_probs_lstm = F.log_softmax(lstm_logits, dim=-1)
     log_probs_xl = F.log_softmax(xl_logits, dim=-1)
+    log_probs_list = [log_probs_lstm, log_probs_xl]
+    if xl_small_logits is not None:
+      log_probs_list.append(F.log_softmax(xl_small_logits, dim=-1))
     if model.mixer is not None:
       # Learned mixer: per-step softmax weights from confidence features.
       # Output is generally unnormalised; log_softmax it to get a valid
       # log-prob distribution for the AC.
-      combined_unnorm = model.mixer([log_probs_lstm, log_probs_xl])
+      combined_unnorm = model.mixer(log_probs_list)
       combined_log_probs = F.log_softmax(combined_unnorm, dim=-1)
     else:
       # Equal-weight geometric mean (the original hybrid behaviour).
-      combined_log_probs = 0.5 * (log_probs_lstm + log_probs_xl)
+      n = float(len(log_probs_list))
+      combined_log_probs = sum(log_probs_list) / n
     probs = F.softmax(combined_log_probs, dim=-1).detach().cpu().numpy()
 
     # ---- Drive the AC: one symbol per parallel stream ----
@@ -1402,12 +1476,17 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
     # components in addition to good solos.
     lstm_opt.zero_grad()
     xl_opt.zero_grad()
+    if xl_small_opt is not None:
+      xl_small_opt.zero_grad()
     if mixer_opt is not None:
       mixer_opt.zero_grad()
 
     lstm_loss_per = F.cross_entropy(lstm_logits, symbols_t, reduction='none')
     xl_loss_per = F.cross_entropy(xl_logits, symbols_t, reduction='none')
     total_loss = (lstm_loss_per * mask_t).sum() + (xl_loss_per * mask_t).sum()
+    if xl_small_logits is not None:
+      xl_small_loss_per = F.cross_entropy(xl_small_logits, symbols_t, reduction='none')
+      total_loss = total_loss + (xl_small_loss_per * mask_t).sum()
 
     if model.mixer is not None:
       # NLL of combined log-probs against actual symbol, masked.
@@ -1421,10 +1500,14 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
     _clip_xl = float(globals().get('clip_xl', 0.25))
     torch.nn.utils.clip_grad_norm_(model.lstm.parameters(), 4.0)
     torch.nn.utils.clip_grad_norm_(model.transformer_xl.parameters(), _clip_xl)
+    if model.transformer_xl_small is not None:
+      torch.nn.utils.clip_grad_norm_(model.transformer_xl_small.parameters(), _clip_xl)
     if model.mixer is not None:
       torch.nn.utils.clip_grad_norm_(model.mixer.parameters(), 4.0)
     lstm_opt.step()
     xl_opt.step()
+    if xl_small_opt is not None:
+      xl_small_opt.step()
     if mixer_opt is not None:
       mixer_opt.step()
 
@@ -1441,11 +1524,15 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
     lstm_states_queue.append([(h.detach(), c.detach()) for (h, c) in new_lstm_state])
     # Transformer-XL: mems already detached inside _update_mems
     xl_mems = new_xl_mems
+    if model.transformer_xl_small is not None:
+      xl_small_mems = new_xl_small_mems
 
-    # Slide both windows by the just-coded symbol
+    # Slide all submodel windows by the just-coded symbol
     symbols_unsq = symbols_t.unsqueeze(1)
     lstm_seq_input = torch.cat([lstm_seq_input[:, 1:], symbols_unsq], dim=1)
     xl_seq_input = torch.cat([xl_seq_input[:, 1:], symbols_unsq], dim=1)
+    if model.transformer_xl_small is not None:
+      xl_small_seq_input = torch.cat([xl_small_seq_input[:, 1:], symbols_unsq], dim=1)
 
     pos += 1
 
