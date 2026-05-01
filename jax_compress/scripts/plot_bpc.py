@@ -121,7 +121,7 @@ OUT_PATH = os.path.normpath(os.path.join(THIS_DIR, '..', 'data', 'bpc_vs_size.pn
 def _dedup_pts(rows):
     """Collapse duplicate sizes: latest entry wins."""
     seen = {}
-    for s, b, l, _p, _ in rows:
+    for s, b, l, *_ in rows:
         seen[s] = (s, b, l)
     return [seen[s] for s in sorted(seen)]
 
@@ -188,14 +188,20 @@ def _plot_refs(ax):
 
 def _format_axis(ax, title):
     ax.set_xscale('log')
+    ax.set_yscale('log')
     ax.set_xlabel('file size (bytes)')
-    ax.set_ylabel('bpc (bits per byte of original)')
+    ax.set_ylabel('bpc (bits per byte of original) [log scale]')
     ax.set_title(title)
     ax.grid(True, which='both', alpha=0.3)
     ax.legend(loc='upper right')
     # Entropy floor annotation
     ax.axhline(y=0.91, color='gray', linestyle=':', alpha=0.5)
     ax.annotate('≈ entropy floor (~0.9 bpc)', xy=(2e4, 0.95), color='gray', fontsize=8)
+    # On a log y-axis, matplotlib defaults to scientific notation; force
+    # plain decimal labels so bpc values like 1.27 read as 1.27 not 10^0.1.
+    from matplotlib.ticker import ScalarFormatter
+    ax.yaxis.set_major_formatter(ScalarFormatter())
+    ax.yaxis.set_minor_formatter(ScalarFormatter())
 
 
 def main():
