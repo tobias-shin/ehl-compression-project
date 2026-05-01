@@ -107,7 +107,11 @@ HYBRID_MIXER_DATA = [
     ( 1_000_000, 1.9934, 'enwik6', 'fp32', 'nncp'),
     # enwik7: --mode compress only; round-trip md5 verified at enwik4-6.
     (10_000_000, 1.6018, 'enwik7', 'fp32', 'nncp'),
-    # (100_000_000, ?, 'enwik8', 'bf16', 'nncp'),
+    # enwik8: 14h 46min, --use-bf16 --mode compress, default hparams.
+    # Beats LSTM by 0.029 bpc (largest gap of the sweep so far). Round-trip
+    # md5 not verified at this size (--mode compress); bf16 round-trip is
+    # verified at enwik4-6 mixer runs.
+    (100_000_000, 1.2626, 'enwik8', 'bf16', 'nncp'),
 ]
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -117,7 +121,7 @@ OUT_PATH = os.path.normpath(os.path.join(THIS_DIR, '..', 'data', 'bpc_vs_size.pn
 def _dedup_pts(rows):
     """Collapse duplicate sizes: latest entry wins."""
     seen = {}
-    for s, b, l, p, _ in rows:
+    for s, b, l, _p, _ in rows:
         seen[s] = (s, b, l)
     return [seen[s] for s in sorted(seen)]
 
@@ -125,7 +129,7 @@ def _dedup_pts(rows):
 def _plot_lstm(ax):
     fp32_pts = [(s, b, l) for (s, b, l, p, _) in DATA if p == 'fp32']
     if fp32_pts:
-        xs, ys, ls = zip(*fp32_pts)
+        xs, ys, _ = zip(*fp32_pts)
         ax.plot(xs, ys, 'o-', color='#1f77b4', label='torch LSTM (fp32)', markersize=8)
         for x, y, l in fp32_pts:
             ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, 6), fontsize=9)
@@ -134,7 +138,7 @@ def _plot_lstm(ax):
 def _plot_transformer_xl(ax):
     xl_pts = _dedup_pts(XL_DATA)
     if xl_pts:
-        xs, ys, ls = zip(*xl_pts)
+        xs, ys, _ = zip(*xl_pts)
         ax.plot(xs, ys, 'D-', color='#d62728', label='torch transformer_xl (fp32)',
                 markersize=8)
         for x, y, l in xl_pts:
@@ -145,7 +149,7 @@ def _plot_transformer_xl(ax):
 def _plot_hybrid(ax):
     hyb_pts = _dedup_pts(HYBRID_DATA)
     if hyb_pts:
-        xs, ys, ls = zip(*hyb_pts)
+        xs, ys, _ = zip(*hyb_pts)
         ax.plot(xs, ys, '*-', color='#8c564b', label='torch hybrid (LSTM + xl, equal-weight)',
                 markersize=12)
         for x, y, l in hyb_pts:
@@ -156,7 +160,7 @@ def _plot_hybrid(ax):
 def _plot_hybrid_mixer(ax):
     pts = _dedup_pts(HYBRID_MIXER_DATA)
     if pts:
-        xs, ys, ls = zip(*pts)
+        xs, ys, _ = zip(*pts)
         ax.plot(xs, ys, 's-', color='#e377c2',
                 label='torch hybrid (LSTM + xl, learned mixer)',
                 markersize=8)
@@ -167,14 +171,14 @@ def _plot_hybrid_mixer(ax):
 
 def _plot_refs(ax):
     if JAX_REF:
-        xs, ys, ls = zip(*JAX_REF)
+        xs, ys, _ = zip(*JAX_REF)
         ax.plot(xs, ys, '^--', color='#2ca02c', label='jax-compress (Knoll, reference)',
                 markersize=8, alpha=0.7)
         for x, y, l in JAX_REF:
             ax.annotate(l, (x, y), textcoords='offset points', xytext=(-8, -14),
                         fontsize=9, color='#2ca02c')
     if NNCP_REF:
-        xs, ys, ls = zip(*NNCP_REF)
+        xs, ys, _ = zip(*NNCP_REF)
         ax.plot(xs, ys, 'v--', color='#9467bd', label='nncp v2.1 (LTCB, reference)',
                 markersize=8, alpha=0.7)
         for x, y, l in NNCP_REF:
