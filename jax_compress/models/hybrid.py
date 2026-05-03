@@ -21,27 +21,16 @@ import torch.nn as nn
 
 
 class HybridModel(nn.Module):
-    def __init__(self, lstm, transformer_xl, transformer_xl_small=None, mixer=None):
+    def __init__(self, lstm, transformer_xl, mixer=None):
         super().__init__()
         assert lstm.vocab_size == transformer_xl.vocab_size, (
             f"vocab_size mismatch: LSTM={lstm.vocab_size}, "
-            f"Transformer-XL={transformer_xl.vocab_size}; submodels must "
+            f"Transformer-XL={transformer_xl.vocab_size}; both submodels must "
             f"see the same vocabulary so the geometric-mean ensemble produces "
             f"a coherent probability distribution for the AC to encode against."
         )
-        if transformer_xl_small is not None:
-            assert transformer_xl_small.vocab_size == lstm.vocab_size, (
-                f"vocab_size mismatch on transformer_xl_small="
-                f"{transformer_xl_small.vocab_size} vs LSTM={lstm.vocab_size}"
-            )
         self.lstm = lstm
         self.transformer_xl = transformer_xl
-        # Optional 3rd submodel: a small Transformer-XL with shallower depth
-        # and shorter mem_len. Tests whether a similar-architecture 3rd
-        # component can give the mixer useful diversity. If it does, a
-        # structurally different 3rd model (e.g., a 1D causal CNN) is the
-        # natural follow-up.
-        self.transformer_xl_small = transformer_xl_small
         # Optional learned mixer. When None, the calling loop
         # (_process_hybrid) falls back to equal-weight geometric mean. When
         # set, the loop calls mixer(log_probs_list) to produce the combined
