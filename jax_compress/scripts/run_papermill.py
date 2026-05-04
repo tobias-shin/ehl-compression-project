@@ -89,14 +89,14 @@ def main():
     ap.add_argument("--retrain-tgt-len", type=int, default=64)
     ap.add_argument("--retrain-mem-len", type=int, default=128)
     ap.add_argument("--xl-lr-schedule",
-                    default="0:7.9e-5 50000:1.6e-5 150000:5.0e-6",
-                    help="Tier 1 NNCP-aligned default. NNCP's published "
-                         "schedule was 0:7.9e-5 341105:1.6e-5 3134681:5.0e-6, "
-                         "tuned for enwik9 at batch_size=64 (~1.5M steps). "
-                         "At our enwik8 budget (~202K steps at batch_size=128) "
-                         "the 341K transition never fired, training at constant "
-                         "7.9e-5 throughout; the new transitions land at "
-                         "~25%%/75%% of an enwik8 run.")
+                    default="0:7.9e-5 341105:1.6e-5 3134681:5.0e-6",
+                    help="NNCP's published schedule from nncp_enwik_base.sh. "
+                         "The 341K and 3.13M transitions were tuned for enwik9 "
+                         "at batch_size=64 (~1.5M steps) and don't fire at our "
+                         "enwik8 budget (~202K steps), so training stays at "
+                         "constant 7.9e-5. Pulling transitions in to 50K/150K "
+                         "regressed enwik8 by +0.0089 bpc (mixer_v2 1.2626 -> "
+                         "mixer_t1 1.2715); reverted.")
     ap.add_argument("--xl-retrain-lr-schedule",
                     default="0:4.0e-4 13000:2.0e-4 93000:1.0e-4 163000:5.0e-5 1911300:1.6e-5")
     # ---- Data-pipeline hparams (override notebook defaults) -------------
