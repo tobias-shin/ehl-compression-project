@@ -1632,7 +1632,23 @@ retrain_lr_schedule_xl = "0:4.0e-4 13000:2.0e-4 93000:1.0e-4 163000:5.0e-5 19113
 clip_xl = 0.25 #@param {type:"number"}
 adam_eps_xl = 1e-9 #@param {type:"number"}
 '''
-params_src = ''.join(nb['cells'][3]['source']) + PARAMS_TB_APPEND
+base_params = ''.join(nb['cells'][3]['source'])
+# Patch retrain_block_len 100K -> 10M (NNCP-base value). Empirically beats
+# 100K by 0.0039 bpc on enwik8 (mixer_v2 1.2626 -> mixer_rb10m 1.2587) at
+# ~10% wall-clock cost. The original 100K was inherited from the LSTM-only
+# notebook tuning; NNCP's transformer config has always used 10M.
+base_params = base_params.replace(
+    'retrain_block_len = 100000 #@param {type:"integer"}\n'
+    '#@markdown _Retrain over the last M symbols._\n',
+    'retrain_block_len = 10000000 #@param {type:"integer"}\n'
+    '#@markdown _Retrain over the last M symbols. NNCP-base value (10M); '
+    'updated from the original 100K based on enwik8 evidence -- '
+    'mixer_v2 1.2626 bpc -> mixer_rb10m 1.2587 bpc (-0.0039) at '
+    '~10% wall-clock cost. The bigger window does not increase per-retrain '
+    'compute (retrain_batch_size * retrain_seq_length sets that); it only '
+    'widens the trailing context retrain may sample from._\n',
+)
+params_src = base_params + PARAMS_TB_APPEND
 nb['cells'][3] = code_cell(params_src, tags=["parameters"])
 
 # Replace JAX-heavy code cells

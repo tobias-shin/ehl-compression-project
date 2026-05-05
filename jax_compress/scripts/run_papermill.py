@@ -111,8 +111,12 @@ def main():
                     help="NNCP preprocess vocab. Notebook default 8192. "
                          "NNCP-base for enwik8 uses 16384.")
     ap.add_argument("--retrain-block-len", type=int, default=None,
-                    help="trailing chars used per retrain. Notebook default "
-                         "100000. NNCP-base uses 10000000 (10M).")
+                    help="trailing chars retrain may sample from. Notebook "
+                         "default is now 10000000 (NNCP-base value); the "
+                         "original 100K was LSTM-tuned and underused the "
+                         "context. 10M improved enwik8 hybrid+mixer by "
+                         "-0.0039 bpc (1.2626 -> 1.2587). Pass an explicit "
+                         "value here to override the notebook default.")
     ap.add_argument("--retrain-batch-size", type=int, default=None,
                     help="batch dim during retrain. Notebook default 256. "
                          "NNCP-base uses 32.")
