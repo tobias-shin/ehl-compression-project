@@ -114,6 +114,60 @@ HYBRID_MIXER_DATA = [
     (100_000_000, 1.2626, 'enwik8', 'bf16', 'nncp'),
 ]
 
+# Hybrid + mixer + Tier 1 LR-schedule pull-in (transitions 50K/150K instead
+# of NNCP's never-firing 341K/3.13M). Committed as default in 7407e2f, then
+# silently disabled by the --xl-lr-schedule CLI default bug, then re-enabled
+# by b0cf21c, then reverted in 0e52492 after this enwik8 regression.
+# clip_xl=0.25 + adam_eps_xl=1e-9 (the other Tier 1 changes) are kept since
+# they're verified neutral here. New schedule was effectively a no-op at
+# enwik4-6 (transitions don't fire), partially fired at enwik7 (50K
+# transition only, last ~28K of ~78K steps), and fired both transitions at
+# enwik8 -- where it cost +0.0089 bpc as the 5e-6 floor undertrains late
+# tokens.
+HYBRID_MIXER_T1_DATA = [
+    (    10_000, 3.6656, 'enwik4', 'fp32', 'none'),
+    (   100_000, 2.6597, 'enwik5', 'fp32', 'nncp'),
+    ( 1_000_000, 1.9930, 'enwik6', 'fp32', 'nncp'),
+    (10_000_000, 1.6014, 'enwik7', 'fp32', 'nncp'),
+    # enwik8: 14h 27min, --use-bf16 --mode compress. +0.0089 bpc vs mixer_v2.
+    (100_000_000, 1.2715, 'enwik8', 'bf16', 'nncp'),
+]
+
+# Hybrid + mixer + adaptive PPM-style n-gram (order=3, Laplace alpha=0.01) as
+# a 3rd submodel through the mixer. Pure stats: no params, no gradients;
+# diversity comes from being structurally orthogonal to the two neural
+# submodels. Combined with Tier 1 clip_xl=0.25 + adam_eps_xl=1e-9 but with
+# the OLD never-firing LR schedule (these runs predate the b0cf21c CLI fix).
+# Helped at enwik7 (-0.020 vs mixer baseline; the strongest gain we've seen
+# at any scale) but hurt at enwik8 (+0.018). Submodel + plumbing reverted in
+# d4b85c7 since it didn't generalize to the largest scale.
+HYBRID_T1_NG_DATA = [
+    # enwik7: 1.5815 -- best result at this scale across all experiments.
+    (10_000_000, 1.5815, 'enwik7', 'fp32', 'nncp'),
+    # enwik8: 1.2805 -- regression vs mixer_v2 (1.2626). About half of the
+    # +0.018 gap is from the ngram, half from the Tier 1 LR pull-in (this run
+    # had the buggy CLI default that silently used OLD schedule, so the
+    # actual confound here is just clip+eps + ngram, not LR pull-in).
+    (100_000_000, 1.2805, 'enwik8', 'bf16', 'nncp'),
+]
+
+# Hybrid + mixer + Transformer-XL submodel scaled up to NNCP-large hparams
+# (d_model=1024, d_head=128, d_inner=4096; 154M XL params vs 44M base).
+# Other NNCP-large hparams adopted: batch_size=64 (was 128), retrain_batch_size=32
+# (was 256), xl_lr_schedule "0:4.0e-5 341105:1.3e-5 3134681:4.0e-6" (lower start
+# LR for the bigger model), matching xl_retrain_lr_schedule. Kept our
+# n_words=8192 preprocess (NOT NNCP-large's 4096) -- "option (b)" of two
+# possible XL-large flavors. LSTM submodel and mixer unchanged.
+HYBRID_MIXER_XL_LARGE_DATA = [
+    # enwik8: 86h 31min, --use-bf16 --mode compress. Total params 295M
+    # (LSTM 142M + XL-large 154M + mixer 0.5K). 5.9x the wall of mixer_rb10m
+    # (14h45m) but improves bpc by 0.0099. Halves the gap to jax-compress
+    # (1.2404 ref) from +0.018 to +0.008. Round-trip not verified at enwik8
+    # (--mode compress); enwik4 dry run with same XL-large config round-trip
+    # md5-matches.
+    (100_000_000, 1.2488, 'enwik8', 'bf16', 'nncp'),
+]
+
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_PATH = os.path.normpath(os.path.join(THIS_DIR, '..', 'data', 'bpc_vs_size.png'))
 
@@ -169,6 +223,36 @@ def _plot_hybrid_mixer(ax):
                         fontsize=9, color='#e377c2')
 
 
+def _plot_hybrid_mixer_t1(ax):
+    pts = _dedup_pts(HYBRID_MIXER_T1_DATA)
+    if pts:
+        xs, ys, _ = zip(*pts)
+        ax.plot(xs, ys, 'x--', color='#ff7f0e',
+                label='torch hybrid + mixer + Tier 1 LR pull-in (reverted)',
+                markersize=8, alpha=0.8)
+
+
+def _plot_hybrid_t1_ng(ax):
+    pts = _dedup_pts(HYBRID_T1_NG_DATA)
+    if pts:
+        xs, ys, _ = zip(*pts)
+        ax.plot(xs, ys, 'P--', color='#bcbd22',
+                label='torch hybrid + mixer + n-gram submodel (reverted)',
+                markersize=9, alpha=0.8)
+
+
+def _plot_hybrid_mixer_xl_large(ax):
+    pts = _dedup_pts(HYBRID_MIXER_XL_LARGE_DATA)
+    if pts:
+        xs, ys, _ = zip(*pts)
+        ax.plot(xs, ys, 'h-', color='#17becf',
+                label='torch hybrid + mixer + XL-large (NNCP-large XL hparams)',
+                markersize=10, markerfacecolor='#17becf')
+        for x, y, l in pts:
+            ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, -14),
+                        fontsize=9, color='#17becf')
+
+
 def _plot_refs(ax):
     if JAX_REF:
         xs, ys, _ = zip(*JAX_REF)
@@ -193,7 +277,7 @@ def _format_axis(ax, title):
     ax.set_ylabel('bpc (bits per byte of original) [log scale]')
     ax.set_title(title)
     ax.grid(True, which='both', alpha=0.3)
-    ax.legend(loc='upper right')
+    ax.legend(loc='upper right', fontsize=8)
     # Entropy floor annotation
     ax.axhline(y=0.91, color='gray', linestyle=':', alpha=0.5)
     ax.annotate('≈ entropy floor (~0.9 bpc)', xy=(2e4, 0.95), color='gray', fontsize=8)
@@ -204,14 +288,65 @@ def _format_axis(ax, title):
     ax.yaxis.set_minor_formatter(ScalarFormatter())
 
 
+def _enwik8_detail(ax):
+    """Single-scale detail panel: every variant's enwik8 bpc as a horizontal
+    band, sorted best-to-worst, with the ablations rendered as outlined dots
+    so they read as 'tried-and-rejected' relative to the solid headline
+    points. Linear y-axis at full resolution -- ~0.02 bpc differences that
+    are invisible on the log-log overview become legible here."""
+    pts = []
+    def add(label, bpc, color, marker, fill=True, weight='normal'):
+        pts.append((label, bpc, color, marker, fill, weight))
+    add('nncp v2.1', 1.2017, '#9467bd', 'v', True, 'bold')
+    add('jax-compress (Knoll)', 1.2404, '#2ca02c', '^', True, 'bold')
+    add('hybrid + mixer + XL-large', 1.2488, '#17becf', 'h', True, 'bold')
+    add('hybrid + mixer + retrain-block 10M', 1.2587, '#e377c2', 's', True)
+    add('hybrid + mixer (mixer_v2)', 1.2626, '#e377c2', 's', True)
+    add('hybrid (equal-weight)', 1.2723, '#8c564b', '*', True)
+    add('mixer + Tier 1 LR pull-in', 1.2715, '#ff7f0e', 'x', False)
+    add('mixer + ngram (t1_ng)', 1.2805, '#bcbd22', 'P', False)
+    add('LSTM solo', 1.2918, '#1f77b4', 'o', True)
+    add('Transformer-XL solo', 1.3734, '#d62728', 'D', True)
+    pts.sort(key=lambda r: r[1])
+    for i, (label, bpc, color, marker, fill, weight) in enumerate(pts):
+        y = len(pts) - 1 - i
+        ms_kwargs = dict(markersize=10) if fill else dict(markersize=11,
+                                                          markerfacecolor='white',
+                                                          markeredgewidth=2)
+        ax.plot([bpc], [y], marker=marker, color=color, linestyle='', **ms_kwargs)
+        ax.annotate(f'{label}', (bpc, y), textcoords='offset points',
+                    xytext=(12, 0), fontsize=9, va='center', color=color,
+                    fontweight=weight)
+        ax.annotate(f'{bpc:.4f}', (bpc, y), textcoords='offset points',
+                    xytext=(-8, 0), fontsize=8, va='center', ha='right',
+                    color='dimgray')
+    # Reference span: nncp v2.1 (1.2017) -> our current best (1.2488 xl_large)
+    ax.axvspan(1.2017, 1.2488, alpha=0.08, color='gray')
+    ax.set_xlabel('bpc (lower is better)')
+    ax.set_yticks([])
+    ax.set_xlim(1.18, 1.42)
+    ax.set_ylim(-0.7, len(pts) - 0.3)
+    ax.set_title('enwik8 detail (linear bpc)')
+    ax.grid(True, axis='x', alpha=0.3)
+    ax.annotate('open marker = reverted experiment', xy=(0.02, 0.02),
+                xycoords='axes fraction', fontsize=7, color='gray',
+                style='italic')
+
+
 def main():
-    fig, ax = plt.subplots(figsize=(8, 5.5))
-    _plot_lstm(ax)
-    _plot_transformer_xl(ax)
-    _plot_hybrid(ax)
-    _plot_hybrid_mixer(ax)
-    _plot_refs(ax)
-    _format_axis(ax, 'Compression rate vs file size — torch_compress')
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6),
+                             gridspec_kw={'width_ratios': [1.4, 1]})
+    ax_main, ax_detail = axes
+    _plot_lstm(ax_main)
+    _plot_transformer_xl(ax_main)
+    _plot_hybrid(ax_main)
+    _plot_hybrid_mixer(ax_main)
+    _plot_hybrid_mixer_t1(ax_main)
+    _plot_hybrid_t1_ng(ax_main)
+    _plot_hybrid_mixer_xl_large(ax_main)
+    _plot_refs(ax_main)
+    _format_axis(ax_main, 'Compression rate vs file size — torch_compress')
+    _enwik8_detail(ax_detail)
     fig.tight_layout()
     fig.savefig(OUT_PATH, dpi=140)
     print(f'wrote {OUT_PATH}')

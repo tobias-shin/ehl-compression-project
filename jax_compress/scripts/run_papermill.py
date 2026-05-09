@@ -75,9 +75,13 @@ def main():
     ap.add_argument("--model-type", choices=["lstm", "transformer_xl", "hybrid"], default="lstm")
     ap.add_argument("--n-layer", type=int, default=12)
     ap.add_argument("--n-head", type=int, default=8)
-    ap.add_argument("--d-model", type=int, default=512)
-    ap.add_argument("--d-head", type=int, default=64)
-    ap.add_argument("--d-inner", type=int, default=2048)
+    ap.add_argument("--d-model", type=int, default=1024,
+                    help="NNCP-large default (was 512 for nncp_enwik_base). "
+                         "Beats base by 0.0099 bpc on enwik8 hybrid+mixer.")
+    ap.add_argument("--d-head", type=int, default=128,
+                    help="NNCP-large default (was 64 for nncp_enwik_base).")
+    ap.add_argument("--d-inner", type=int, default=4096,
+                    help="NNCP-large default (was 2048 for nncp_enwik_base).")
     ap.add_argument("--mem-len", type=int, default=160)
     ap.add_argument("--ext-tgt-len", type=int, default=31)
     ap.add_argument("--attn-type", type=int, default=1)
@@ -89,24 +93,26 @@ def main():
     ap.add_argument("--retrain-tgt-len", type=int, default=64)
     ap.add_argument("--retrain-mem-len", type=int, default=128)
     ap.add_argument("--xl-lr-schedule",
-                    default="0:7.9e-5 341105:1.6e-5 3134681:5.0e-6",
-                    help="NNCP's published schedule from nncp_enwik_base.sh. "
-                         "The 341K and 3.13M transitions were tuned for enwik9 "
-                         "at batch_size=64 (~1.5M steps) and don't fire at our "
-                         "enwik8 budget (~202K steps), so training stays at "
-                         "constant 7.9e-5. Pulling transitions in to 50K/150K "
-                         "regressed enwik8 by +0.0089 bpc (mixer_v2 1.2626 -> "
-                         "mixer_t1 1.2715); reverted.")
+                    default="0:4.0e-5 341105:1.3e-5 3134681:4.0e-6",
+                    help="NNCP-large default (was nncp_enwik_base's 7.9e-5 "
+                         "schedule). Lower starting LR compensates for the "
+                         "bigger XL model's higher gradient magnitude. The "
+                         "341K/3.13M transitions don't fire at our enwik8 "
+                         "budget; pulling them in to 50K/150K regressed "
+                         "enwik8 by +0.0089 bpc and was reverted.")
     ap.add_argument("--xl-retrain-lr-schedule",
-                    default="0:4.0e-4 13000:2.0e-4 93000:1.0e-4 163000:5.0e-5 1911300:1.6e-5")
+                    default="0:1.6e-4 13000:1.6e-4 93000:7.9e-5 163000:4.0e-5 1911300:1.3e-5",
+                    help="NNCP-large default (was nncp_enwik_base values).")
     # ---- Data-pipeline hparams (override notebook defaults) -------------
     # These are the LSTM-tuned defaults baked into the notebook params cell.
     # NNCP's nncp_enwik_base.sh uses very different values for enwik8/9 --
     # exposing them here so transformer runs can match NNCP without editing
     # the notebook.
     ap.add_argument("--batch-size", type=int, default=None,
-                    help="parallel streams. Notebook default 128 (LSTM-tuned). "
-                         "NNCP-base for enwik8 uses 64.")
+                    help="parallel streams. Notebook default is now 64 "
+                         "(NNCP-large value; required for VRAM headroom on "
+                         "the XL-large submodel). Override to 128 for "
+                         "transformer_xl-base or LSTM-only.")
     ap.add_argument("--n-words", type=int, default=None,
                     help="NNCP preprocess vocab. Notebook default 8192. "
                          "NNCP-base for enwik8 uses 16384.")
@@ -118,8 +124,10 @@ def main():
                          "-0.0039 bpc (1.2626 -> 1.2587). Pass an explicit "
                          "value here to override the notebook default.")
     ap.add_argument("--retrain-batch-size", type=int, default=None,
-                    help="batch dim during retrain. Notebook default 256. "
-                         "NNCP-base uses 32.")
+                    help="batch dim during retrain. Notebook default is now "
+                         "32 (NNCP-large value); the original 256 was "
+                         "LSTM-tuned and over-allocates VRAM for the "
+                         "XL-large retrain pass.")
     ap.add_argument("--retrain-period-schedule", default=None,
                     help='step-units schedule for retrain period. Notebook '
                          'default "0:1001 200000:5001". NNCP-base equivalent '
