@@ -168,6 +168,30 @@ HYBRID_MIXER_XL_LARGE_DATA = [
     (100_000_000, 1.2488, 'enwik8', 'bf16', 'nncp'),
 ]
 
+# Hybrid + mixer + XL-large + the two remaining NNCP-large knobs that
+# HYBRID_MIXER_XL_LARGE_DATA didn't ship: n_words=4096 (was 8192) and
+# retrain_block_len=15M (was 10M). Tests whether the full NNCP-large config
+# closes more of the gap to nncp v2.1, on top of the model-size win.
+HYBRID_MIXER_XL_LARGE_FULL_DATA = [
+    # enwik4: 37s, --preprocess none (file too small for an n-words=4096
+    # dictionary). -0.1624 bpc vs mixer baseline (3.6656 -> 3.5032). The
+    # 154M XL submodel is wildly over-parameterised for 78 streaming steps
+    # but the extra capacity still helps per step at this regime.
+    (    10_000, 3.5032, 'enwik4', 'bf16', 'none'),
+    # enwik5: 3.7min. -0.0856 vs baseline (2.6597 -> 2.5741).
+    (   100_000, 2.5741, 'enwik5', 'bf16', 'nncp'),
+    # enwik6: 25.4min. -0.0500 vs baseline (1.9934 -> 1.9434).
+    ( 1_000_000, 1.9434, 'enwik6', 'bf16', 'nncp'),
+    # enwik7: 4h 42min. -0.0262 vs baseline (1.6018 -> 1.5756). Lowest bpc
+    # on this file in the codebase, beats the prior best (t1_ng at 1.5815).
+    (10_000_000, 1.5756, 'enwik7', 'bf16', 'nncp'),
+    # enwik8: 114h 55min, --use-bf16 --mode compress. -0.0011 bpc vs
+    # xl_large alone -- marginal but real. Wall is 1.33x xl_large from the
+    # 20%-more-tokens overhead of n_words=4096. Round-trip not verified at
+    # enwik8 (--mode compress).
+    (100_000_000, 1.2477, 'enwik8', 'bf16', 'nncp'),
+]
+
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_PATH = os.path.normpath(os.path.join(THIS_DIR, '..', 'data', 'bpc_vs_size.png'))
 
@@ -253,6 +277,18 @@ def _plot_hybrid_mixer_xl_large(ax):
                         fontsize=9, color='#17becf')
 
 
+def _plot_hybrid_mixer_xl_large_full(ax):
+    pts = _dedup_pts(HYBRID_MIXER_XL_LARGE_FULL_DATA)
+    if pts:
+        xs, ys, _ = zip(*pts)
+        ax.plot(xs, ys, 'p-', color='#9edae5',
+                label='torch hybrid + mixer + XL-large + n_words=4096 (full NNCP-large)',
+                markersize=10, markerfacecolor='#9edae5')
+        for x, y, l in pts:
+            ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, 6),
+                        fontsize=9, color='#17becf')
+
+
 def _plot_refs(ax):
     if JAX_REF:
         xs, ys, _ = zip(*JAX_REF)
@@ -299,6 +335,7 @@ def _enwik8_detail(ax):
         pts.append((label, bpc, color, marker, fill, weight))
     add('nncp v2.1', 1.2017, '#9467bd', 'v', True, 'bold')
     add('jax-compress (Knoll)', 1.2404, '#2ca02c', '^', True, 'bold')
+    add('hybrid + mixer + full NNCP-large', 1.2477, '#9edae5', 'p', True, 'bold')
     add('hybrid + mixer + XL-large', 1.2488, '#17becf', 'h', True, 'bold')
     add('hybrid + mixer + retrain-block 10M', 1.2587, '#e377c2', 's', True)
     add('hybrid + mixer (mixer_v2)', 1.2626, '#e377c2', 's', True)
@@ -320,8 +357,8 @@ def _enwik8_detail(ax):
         ax.annotate(f'{bpc:.4f}', (bpc, y), textcoords='offset points',
                     xytext=(-8, 0), fontsize=8, va='center', ha='right',
                     color='dimgray')
-    # Reference span: nncp v2.1 (1.2017) -> our current best (1.2488 xl_large)
-    ax.axvspan(1.2017, 1.2488, alpha=0.08, color='gray')
+    # Reference span: nncp v2.1 (1.2017) -> our current best (1.2477 xl_large_full)
+    ax.axvspan(1.2017, 1.2477, alpha=0.08, color='gray')
     ax.set_xlabel('bpc (lower is better)')
     ax.set_yticks([])
     ax.set_xlim(1.18, 1.42)
@@ -344,6 +381,7 @@ def main():
     _plot_hybrid_mixer_t1(ax_main)
     _plot_hybrid_t1_ng(ax_main)
     _plot_hybrid_mixer_xl_large(ax_main)
+    _plot_hybrid_mixer_xl_large_full(ax_main)
     _plot_refs(ax_main)
     _format_axis(ax_main, 'Compression rate vs file size — torch_compress')
     _enwik8_detail(ax_detail)
