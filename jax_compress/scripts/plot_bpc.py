@@ -379,8 +379,12 @@ def main():
     _plot_hybrid(ax_main)
     _plot_hybrid_mixer(ax_main)
     _plot_hybrid_mixer_t1(ax_main)
-    _plot_hybrid_t1_ng(ax_main)
-    _plot_hybrid_mixer_xl_large(ax_main)
+    # _plot_hybrid_t1_ng(ax_main)  -- only enwik7/8 measured; omitted from
+    #     the curve panel because it doesn't have a full enwik4-8 sweep.
+    #     Still listed in the enwik8 detail panel.
+    # _plot_hybrid_mixer_xl_large(ax_main)  -- only enwik8 measured (the
+    #     n_words=8192 "option b" intermediate before the full NNCP-large
+    #     sweep). Single-point curve; same reason as above.
     _plot_hybrid_mixer_xl_large_full(ax_main)
     _plot_refs(ax_main)
     _format_axis(ax_main, 'Compression rate vs file size — torch_compress')
