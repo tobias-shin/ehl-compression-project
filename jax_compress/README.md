@@ -19,6 +19,41 @@ Feel free to contact me at byron@byronknoll.com if you have any questions.
 
 **Advanced Usage:** Save a copy of this notebook to your own Google Drive and modify the code as needed.
 
+**PyTorch port:** `torch_compress.ipynb` and `torch_compress_decompressor.ipynb` (the LTCB-style slim decompressor) are generated from `jax_compress.ipynb` by `scripts/build_torch_notebooks.py`. After regenerating, run `python scripts/smoke_test.py` for a fast CPU round-trip + determinism + cross-notebook check.
+
+**Local CLI driver:** to compress / decompress a real file outside Colab, use `scripts/run_local.py`:
+
+```bash
+# Round-trip self-check on any file (verifies md5(input) == md5(decompressed))
+python scripts/run_local.py roundtrip <file>
+
+# Or compress / decompress separately
+python scripts/run_local.py compress <input> <output.zc>
+python scripts/run_local.py decompress <output.zc> <recovered>
+```
+
+Defaults to a small CPU model (`rnn_units=64, num_layers=2`); pass `--rnn-units 1400 --num-layers 8` to match the full Colab config.
+
+NNCP-style periodic retraining is on by default with `--retrain-period "0:1001 200000:5001"` (i.e. retrain every ~1k–5k steps over the trailing `--retrain-block-len` symbols). For files small enough that retrain wouldn't fire (e.g. < a few KB at default batch size) it's a no-op. Pass `--no-retrain` to disable, or override any of `--retrain-period / --retrain-block-len / --retrain-seq-length / --retrain-batch-size / --retrain-lr-schedule / --retrain-dropout` to tune.
+
+**TensorBoard comparison (jax-compress vs torch-compress).** `torch_compress.ipynb` and `scripts/run_local.py` can write training scalars (`train/bpc`, `train/lr`, `train/elapsed_sec`, `train/steps_per_sec`, plus retrain events) to TensorBoard. The original `jax_compress.ipynb` is not modified; instead, save its stdout and feed it to `scripts/parse_jax_log.py` to emit the same scalar names from the JAX run.
+
+```bash
+# 1. Torch run — turn tensorboard on, give the run a name
+python scripts/run_local.py compress enwik6 enwik6.zc \
+    --tensorboard --tb-run-name torch_v1 --tb-logdir runs
+
+# 2. JAX run — capture stdout, then convert it to tb events
+#    (in Colab: !python jax_compress.ipynb 2>&1 | tee jax_v1.log
+#     or save the cell output, then download the log)
+python scripts/parse_jax_log.py jax_v1.log --run-name jax_v1 --logdir runs
+
+# 3. Compare side-by-side
+tensorboard --logdir runs
+```
+
+The same tags are used for both backends, so JAX and PyTorch curves overlay directly. The torch notebook also accepts the corresponding params (`tensorboard`, `tensorboard_run_name`, `tensorboard_logdir`) inside Colab.
+
 ### Related Projects
 *   [tensorflow-compress](https://github.com/byronknoll/tensorflow-compress)
 *   [NNCP](https://bellard.org/nncp/)
