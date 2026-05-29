@@ -176,14 +176,36 @@ HYBRID_MIXER_XL_LARGE_DATA = [
 # d_model=1024/d_head=128/d_inner=4096/n_layer=12, same NNCP-large LR
 # schedule, same batch_size=64, same retrain_block_len=15M,
 # n_words=4096. Pure single-model run for direct head-to-head with NNCP
-# v2.1 (1.2017 enwik8) -- intended to isolate "what's our XL submodel
-# alone worth, before the mixer ensembling effect". Result at enwik8 is
-# 1.3388 -- the LSTM submodel was meaningfully contributing (-0.091 in
-# the hybrid vs solo at enwik8) AND there's a substantial 0.137 bpc gap
-# from our XL alone to NNCP's XL alone at the same architecture spec,
-# suggesting a numerics/training-loop fidelity gap (fp16 vs bf16,
-# deterministic mode, or training-loop drift).
+# v2.1 (1.2017 enwik8) -- isolates "what is our XL submodel alone
+# worth, before the mixer ensembling effect". Result at enwik8 is 1.3388;
+# 0.137 bpc above NNCP at the same architecture+hparams.
+#
+# Subsequent ablations ruled out two hypotheses for that gap:
+#   - fp16 vs bf16 precision: bit-identical (max delta 0.001 bpc), see
+#     TRANSFORMER_XL_LARGE_SOLO_FP16_DATA.
+#   - deterministic vs non-deterministic kernels: exactly identical at
+#     every scale (24% wall speedup with no bpc cost), see
+#     TRANSFORMER_XL_LARGE_SOLO_NONDET_DATA.
+# So the 0.137 bpc gap to NNCP is almost certainly training-loop
+# fidelity drift in our _process_transformer_xl vs NNCP's nncp.py.
 TRANSFORMER_XL_LARGE_SOLO_DATA = [
+    (    10_000, 4.0496, 'enwik4', 'bf16', 'none'),
+    (   100_000, 3.2240, 'enwik5', 'bf16', 'nncp'),
+    ( 1_000_000, 2.3516, 'enwik6', 'bf16', 'nncp'),
+    (10_000_000, 1.7630, 'enwik7', 'bf16', 'nncp'),
+    (100_000_000, 1.3388, 'enwik8', 'bf16', 'nncp'),
+]
+
+# Same XL-large solo config but with --no-deterministic. Tests whether
+# the LTCB-style determinism preamble (CUBLAS_WORKSPACE_CONFIG=:4096:8,
+# torch.use_deterministic_algorithms(True),
+# allow_bf16_reduced_precision_reduction=False, cudnn.deterministic=True)
+# explains the 0.137 bpc gap to NNCP v2.1. Conclusion: it does not --
+# bpc is bit-identical to the deterministic run at EVERY scale. Wall time
+# is 15-25% faster though, so non-det is the right default for
+# day-to-day R&D iterations (only flip back for LTCB submissions
+# requiring cross-machine bit-exact decode).
+TRANSFORMER_XL_LARGE_SOLO_NONDET_DATA = [
     (    10_000, 4.0496, 'enwik4', 'bf16', 'none'),
     (   100_000, 3.2240, 'enwik5', 'bf16', 'nncp'),
     ( 1_000_000, 2.3516, 'enwik6', 'bf16', 'nncp'),
