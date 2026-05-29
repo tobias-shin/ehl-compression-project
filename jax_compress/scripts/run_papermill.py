@@ -61,6 +61,12 @@ def main():
     ap.add_argument("--use-bf16", dest="use_bf16", action="store_true")
     ap.add_argument("--no-bf16", dest="use_bf16", action="store_false")
     ap.set_defaults(use_bf16=False)
+    ap.add_argument("--use-fp16", dest="use_fp16", action="store_true",
+                    help="float16 mixed precision (NNCP-style). Takes "
+                         "precedence over --use-bf16. Untested for "
+                         "round-trip stability; verify with --mode both.")
+    ap.add_argument("--no-fp16", dest="use_fp16", action="store_false")
+    ap.set_defaults(use_fp16=False)
     ap.add_argument("--preprocess", default="nncp", choices=["nncp", "none"])
     ap.add_argument("--tb-run-name", required=True)
     ap.add_argument("--tb-logdir", default="data/tensorboard")
@@ -157,6 +163,7 @@ def main():
         "path_to_file": args.input,
         "preprocess": args.preprocess,
         "use_bf16": args.use_bf16,
+        "use_fp16": args.use_fp16,
         "mode": args.mode,
         "tensorboard": True,
         "tensorboard_run_name": args.tb_run_name,
@@ -203,7 +210,7 @@ def main():
     if args.clip_xl is not None: params["clip_xl"] = args.clip_xl
     if args.adam_eps_xl is not None: params["adam_eps_xl"] = args.adam_eps_xl
 
-    print(f"[run_papermill] input={args.input} use_bf16={args.use_bf16} preprocess={args.preprocess}")
+    print(f"[run_papermill] input={args.input} use_bf16={args.use_bf16} use_fp16={args.use_fp16} preprocess={args.preprocess}")
     print(f"[run_papermill] tb_run_name={args.tb_run_name}")
     print(f"[run_papermill] params: {json.dumps(params, indent=2)}")
 

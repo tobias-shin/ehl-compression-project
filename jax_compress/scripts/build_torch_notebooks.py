@@ -359,17 +359,32 @@ def detach_states(states_per_model):
   ]
 
 
+def _resolve_precision():
+  """Pick the mixed-precision dtype from globals. Priority: fp16 > bf16 > fp32.
+
+  Returns (ac_dtype, enabled). When CUDA is unavailable, falls back to fp32
+  regardless of the flags so smoke tests on CPU still work.
+  """
+  if not torch.cuda.is_available():
+    return torch.float32, False
+  if bool(globals().get('use_fp16', False)):
+    return torch.float16, True
+  if bool(globals().get('use_bf16', False)):
+    return torch.bfloat16, True
+  return torch.float32, False
+
+
 def _lstm_autocast(device):
-  """Returns a bf16 autocast context if ``use_bf16`` is set and CUDA is available.
+  """Returns a mixed-precision autocast context per ``use_fp16``/``use_bf16``.
 
   When disabled, returns a no-op autocast context so call sites stay uniform.
   Parameters and the loss/backward stay in fp32; only the forward matmuls inside
-  ``LSTMModel`` run in bf16. The model's ``return logits.float()`` upcasts the
-  logits at the boundary so the arithmetic coder always sees fp32 probabilities.
+  ``LSTMModel`` run in the autocast dtype. The model's ``return logits.float()``
+  upcasts the logits at the boundary so the arithmetic coder always sees fp32
+  probabilities.
   """
-  use_bf16_flag = bool(globals().get('use_bf16', False)) and torch.cuda.is_available()
-  ac_dtype = torch.bfloat16 if use_bf16_flag else torch.float32
-  return torch.autocast(device_type=device.type, dtype=ac_dtype, enabled=use_bf16_flag)
+  ac_dtype, enabled = _resolve_precision()
+  return torch.autocast(device_type=device.type, dtype=ac_dtype, enabled=enabled)
 
 
 def forward_ensemble(models, inputs, states_per_model):
@@ -488,8 +503,10 @@ def process(compress, length, vocab_size, coder, data):
   retrain_p_schedule = parse_schedule(retrain_period_schedule)
   retrain_l_schedule = parse_schedule(retrain_lr_schedule)
 
-  _use_bf16_active = bool(globals().get('use_bf16', False)) and torch.cuda.is_available()
-  print(f"precision={'bf16' if _use_bf16_active else 'fp32'}")
+  _ac_dtype, _ac_enabled = _resolve_precision()
+  _ac_label = {torch.float16: 'fp16', torch.bfloat16: 'bf16',
+               torch.float32: 'fp32'}[_ac_dtype]
+  print(f"precision={_ac_label}")
   print(f"batch_size={batch_size}, seq_length={seq_length}, rnn_units={rnn_units}, num_layers={num_layers}, "
         f"embedding_size={embedding_size}, ensemble_size={ensemble_size}, learning_rate_schedule={learning_rate_schedule}, "
         f"adam_b1={adam_b1}, adam_b2={adam_b2}, adam_eps={adam_eps}, "
@@ -828,8 +845,7 @@ def _process_transformer_xl(compress, length, vocab_size, coder, data):
   # Without that flag, bf16 matmul kernels accumulated reductions in bf16
   # with non-deterministic thread ordering, breaking encode/decode agreement
   # on probabilities during retrain (see commit 3f6a620 for the diagnostic).
-  use_bf16_flag = bool(globals().get('use_bf16', False))
-  ac_dtype = torch.bfloat16 if use_bf16_flag else torch.float32
+  ac_dtype, use_bf16_flag = _resolve_precision()  # var name kept; "enabled" semantics
 
   start = time.time()
   last_print_time = start
@@ -1093,8 +1109,7 @@ def _retrain_transformer_xl(*, models, retrain_optimizers, current_lr, file_data
   for model in models:
     model.reset_length(retrain_tgt_len, 0, retrain_mem_len)
 
-  use_bf16_flag = bool(globals().get('use_bf16', False))
-  ac_dtype = torch.bfloat16 if use_bf16_flag else torch.float32
+  ac_dtype, use_bf16_flag = _resolve_precision()  # var name kept; "enabled" semantics
 
   ensemble_losses = []
   try:
@@ -1190,8 +1205,7 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
   # bf16 mixed precision: applies only to the Transformer-XL submodel's
   # forward (LSTM cell loop runs in fp32 regardless -- bf16 isn't wired into
   # LSTMModel and the BPTT compounding makes it risky there).
-  use_bf16_flag = bool(globals().get('use_bf16', False))
-  ac_dtype = torch.bfloat16 if use_bf16_flag else torch.float32
+  ac_dtype, use_bf16_flag = _resolve_precision()  # var name kept; "enabled" semantics
 
   start = time.time()
   last_print_time = start
@@ -1596,6 +1610,10 @@ tensorboard_logdir = "data/tensorboard" #@param {type:"string"}
 #@markdown ---
 use_bf16 = True #@param {type:"boolean"}
 #@markdown _Run the model forward/backward in bfloat16 mixed precision. ~2x faster on bf16-capable GPUs (Ampere/Hopper, GH200/H100). Compress and decompress MUST use the same setting -- a file compressed with use_bf16=True can only be decompressed with use_bf16=True (and vice versa)._
+
+#@markdown ---
+use_fp16 = False #@param {type:"boolean"}
+#@markdown _Run the model in float16 mixed precision. NNCP-style. Takes precedence over `use_bf16`. fp16 has more mantissa precision than bf16 (better for deep transformer accumulation) but a much smaller exponent range -- gradients can underflow. We do NOT use `GradScaler`, so this is best-effort: untested for round-trip stability and may produce different bpc than bf16 even on the same input. Round-trip safety must be verified per run via `--mode both`._
 
 #@markdown ---
 model_type = "lstm" #@param ["lstm", "transformer_xl"]
