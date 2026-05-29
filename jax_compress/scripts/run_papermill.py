@@ -131,6 +131,10 @@ def main():
     ap.add_argument("--n-words", type=int, default=None,
                     help="NNCP preprocess vocab. Notebook default 8192. "
                          "NNCP-base for enwik8 uses 16384.")
+    ap.add_argument("--min-freq", type=int, default=None,
+                    help="NNCP preprocess minimum word frequency to enter "
+                         "the dictionary. Notebook default 64. NNCP-large "
+                         "uses 512 for enwik8 AND enwik9.")
     ap.add_argument("--retrain-block-len", type=int, default=None,
                     help="trailing chars retrain may sample from. Notebook "
                          "default is now 10000000 (NNCP-base value); the "
@@ -211,6 +215,7 @@ def main():
     # existing run scripts that don't pass these new flags.
     if args.batch_size is not None: params["batch_size"] = args.batch_size
     if args.n_words is not None: params["n_words"] = args.n_words
+    if args.min_freq is not None: params["min_freq"] = args.min_freq
     if args.retrain_block_len is not None: params["retrain_block_len"] = args.retrain_block_len
     if args.retrain_batch_size is not None: params["retrain_batch_size"] = args.retrain_batch_size
     if args.retrain_period_schedule is not None: params["retrain_period_schedule"] = args.retrain_period_schedule
