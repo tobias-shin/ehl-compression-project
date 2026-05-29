@@ -172,6 +172,25 @@ HYBRID_MIXER_XL_LARGE_DATA = [
 # HYBRID_MIXER_XL_LARGE_DATA didn't ship: n_words=4096 (was 8192) and
 # retrain_block_len=15M (was 10M). Tests whether the full NNCP-large config
 # closes more of the gap to nncp v2.1, on top of the model-size win.
+# Transformer-XL solo (no LSTM, no mixer) with NNCP-large hparams: same
+# d_model=1024/d_head=128/d_inner=4096/n_layer=12, same NNCP-large LR
+# schedule, same batch_size=64, same retrain_block_len=15M,
+# n_words=4096. Pure single-model run for direct head-to-head with NNCP
+# v2.1 (1.2017 enwik8) -- intended to isolate "what's our XL submodel
+# alone worth, before the mixer ensembling effect". Result at enwik8 is
+# 1.3388 -- the LSTM submodel was meaningfully contributing (-0.091 in
+# the hybrid vs solo at enwik8) AND there's a substantial 0.137 bpc gap
+# from our XL alone to NNCP's XL alone at the same architecture spec,
+# suggesting a numerics/training-loop fidelity gap (fp16 vs bf16,
+# deterministic mode, or training-loop drift).
+TRANSFORMER_XL_LARGE_SOLO_DATA = [
+    (    10_000, 4.0496, 'enwik4', 'bf16', 'none'),
+    (   100_000, 3.2240, 'enwik5', 'bf16', 'nncp'),
+    ( 1_000_000, 2.3516, 'enwik6', 'bf16', 'nncp'),
+    (10_000_000, 1.7630, 'enwik7', 'bf16', 'nncp'),
+    (100_000_000, 1.3388, 'enwik8', 'bf16', 'nncp'),
+]
+
 HYBRID_MIXER_XL_LARGE_FULL_DATA = [
     # enwik4: 37s, --preprocess none (file too small for an n-words=4096
     # dictionary). -0.1624 bpc vs mixer baseline (3.6656 -> 3.5032). The
@@ -289,6 +308,15 @@ def _plot_hybrid_mixer_xl_large_full(ax):
                         fontsize=9, color='#17becf')
 
 
+def _plot_transformer_xl_large_solo(ax):
+    pts = _dedup_pts(TRANSFORMER_XL_LARGE_SOLO_DATA)
+    if pts:
+        xs, ys, _ = zip(*pts)
+        ax.plot(xs, ys, 'D--', color='#ff9896',
+                label='torch transformer_xl-large solo (bf16, NNCP-large hparams)',
+                markersize=8, alpha=0.85)
+
+
 def _plot_refs(ax):
     if JAX_REF:
         xs, ys, _ = zip(*JAX_REF)
@@ -343,7 +371,8 @@ def _enwik8_detail(ax):
     add('mixer + Tier 1 LR pull-in', 1.2715, '#ff7f0e', 'x', False)
     add('mixer + ngram (t1_ng)', 1.2805, '#bcbd22', 'P', False)
     add('LSTM solo', 1.2918, '#1f77b4', 'o', True)
-    add('Transformer-XL solo', 1.3734, '#d62728', 'D', True)
+    add('XL-large solo (NNCP-large hparams)', 1.3388, '#ff9896', 'D', True)
+    add('Transformer-XL-base solo', 1.3734, '#d62728', 'D', True)
     pts.sort(key=lambda r: r[1])
     for i, (label, bpc, color, marker, fill, weight) in enumerate(pts):
         y = len(pts) - 1 - i
@@ -386,6 +415,7 @@ def main():
     #     n_words=8192 "option b" intermediate before the full NNCP-large
     #     sweep). Single-point curve; same reason as above.
     _plot_hybrid_mixer_xl_large_full(ax_main)
+    _plot_transformer_xl_large_solo(ax_main)
     _plot_refs(ax_main)
     _format_axis(ax_main, 'Compression rate vs file size — torch_compress')
     _enwik8_detail(ax_detail)
