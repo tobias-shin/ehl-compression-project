@@ -67,6 +67,15 @@ def main():
                          "round-trip stability; verify with --mode both.")
     ap.add_argument("--no-fp16", dest="use_fp16", action="store_false")
     ap.set_defaults(use_fp16=False)
+    ap.add_argument("--use-deterministic", dest="use_deterministic",
+                    action="store_true",
+                    help="LTCB-style deterministic kernels (default).")
+    ap.add_argument("--no-deterministic", dest="use_deterministic",
+                    action="store_false",
+                    help="Disable deterministic cuBLAS/cuDNN -- faster but "
+                         "the AC may not be bit-exact across machines. NNCP "
+                         "runs this way; use it to compare against NNCP.")
+    ap.set_defaults(use_deterministic=True)
     ap.add_argument("--preprocess", default="nncp", choices=["nncp", "none"])
     ap.add_argument("--tb-run-name", required=True)
     ap.add_argument("--tb-logdir", default="data/tensorboard")
@@ -164,6 +173,7 @@ def main():
         "preprocess": args.preprocess,
         "use_bf16": args.use_bf16,
         "use_fp16": args.use_fp16,
+        "use_deterministic": args.use_deterministic,
         "mode": args.mode,
         "tensorboard": True,
         "tensorboard_run_name": args.tb_run_name,

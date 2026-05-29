@@ -45,22 +45,34 @@ def md_cell(source: str):
 IMPORTS_SRC = '''#@title Imports
 
 # --- LTCB determinism preamble ---------------------------------------------
-# CUBLAS_WORKSPACE_CONFIG must be set before any CUDA initialization, otherwise
-# torch.use_deterministic_algorithms will refuse to enable strict mode.
+# When use_deterministic is True (default), force the deterministic cuBLAS /
+# cuDNN paths needed for bit-identical encode/decode in the AC. NNCP doesn't
+# constrain these and may use faster non-deterministic kernels; set
+# use_deterministic=False to compare against that regime (and accept that
+# decompression on a different machine may not be bit-exact).
+#
+# CUBLAS_WORKSPACE_CONFIG must be set BEFORE the first CUDA initialization,
+# otherwise torch.use_deterministic_algorithms will refuse to enable strict
+# mode. We read use_deterministic from globals(), which is populated by the
+# Parameters cell that runs before this Imports cell.
 import os
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+_use_det = bool(globals().get('use_deterministic', True))
+if _use_det:
+  os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import torch
-torch.use_deterministic_algorithms(True, warn_only=False)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-# Force bf16 matmul accumulation in fp32 (default is bf16 reduction). Without
-# this, parallel reductions in bf16 matmul kernels on CUDA produce bit-
-# different outputs across kernel launches given identical inputs, which
-# breaks the encode/decode probability agreement the arithmetic coder needs.
-# No-op on fp32 runs; ~10-20% slowdown vs bf16-reduce on bf16 runs in
-# exchange for round-trip-safe determinism.
-torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+if _use_det:
+  torch.use_deterministic_algorithms(True, warn_only=False)
+  torch.backends.cudnn.deterministic = True
+  torch.backends.cudnn.benchmark = False
+  # Force bf16 matmul accumulation in fp32 (default is bf16 reduction).
+  # Without this, parallel reductions in bf16 matmul kernels on CUDA produce
+  # bit-different outputs across kernel launches given identical inputs,
+  # which breaks the encode/decode probability agreement the AC needs.
+  # No-op on fp32 runs; ~10-20% slowdown vs bf16-reduce on bf16 runs in
+  # exchange for round-trip-safe determinism.
+  torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+print(f"deterministic_mode={'on' if _use_det else 'off'}")
 # ---------------------------------------------------------------------------
 
 import torch.nn as nn
@@ -1614,6 +1626,10 @@ use_bf16 = True #@param {type:"boolean"}
 #@markdown ---
 use_fp16 = False #@param {type:"boolean"}
 #@markdown _Run the model in float16 mixed precision. NNCP-style. Takes precedence over `use_bf16`. fp16 has more mantissa precision than bf16 (better for deep transformer accumulation) but a much smaller exponent range -- gradients can underflow. We do NOT use `GradScaler`, so this is best-effort: untested for round-trip stability and may produce different bpc than bf16 even on the same input. Round-trip safety must be verified per run via `--mode both`._
+
+#@markdown ---
+use_deterministic = True #@param {type:"boolean"}
+#@markdown _Force the deterministic cuBLAS / cuDNN paths needed for bit-identical encode/decode in the arithmetic coder (LTCB-style determinism). NNCP doesn't constrain this and may use faster non-deterministic kernels with different numerics; set to False to test against that regime. When False, decompression on a different machine may not be bit-exact even with identical hparams. Round-trip on the SAME machine is usually fine because both encode and decode use the same kernels in sequence._
 
 #@markdown ---
 model_type = "lstm" #@param ["lstm", "transformer_xl"]
