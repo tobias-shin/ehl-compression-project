@@ -191,6 +191,19 @@ TRANSFORMER_XL_LARGE_SOLO_DATA = [
     (100_000_000, 1.3388, 'enwik8', 'bf16', 'nncp'),
 ]
 
+# Same XL-large solo config but with fp16 mixed precision (--use-fp16
+# --no-bf16). NNCP uses fp16 (per nncp_enwik_*.sh: --fp16); this run
+# tests whether bf16-vs-fp16 explains the 0.137 bpc gap from our XL
+# solo to NNCP v2.1's. Conclusion: it does not -- fp16 lands within
+# 0.001 bpc of bf16 at every scale.
+TRANSFORMER_XL_LARGE_SOLO_FP16_DATA = [
+    (    10_000, 4.0496, 'enwik4', 'fp16', 'none'),
+    (   100_000, 3.2241, 'enwik5', 'fp16', 'nncp'),
+    ( 1_000_000, 2.3521, 'enwik6', 'fp16', 'nncp'),
+    (10_000_000, 1.7636, 'enwik7', 'fp16', 'nncp'),
+    (100_000_000, 1.3387, 'enwik8', 'fp16', 'nncp'),
+]
+
 HYBRID_MIXER_XL_LARGE_FULL_DATA = [
     # enwik4: 37s, --preprocess none (file too small for an n-words=4096
     # dictionary). -0.1624 bpc vs mixer baseline (3.6656 -> 3.5032). The
@@ -317,6 +330,15 @@ def _plot_transformer_xl_large_solo(ax):
                 markersize=8, alpha=0.85)
 
 
+def _plot_transformer_xl_large_solo_fp16(ax):
+    pts = _dedup_pts(TRANSFORMER_XL_LARGE_SOLO_FP16_DATA)
+    if pts:
+        xs, ys, _ = zip(*pts)
+        ax.plot(xs, ys, 'd:', color='#c49c94',
+                label='torch transformer_xl-large solo (fp16, NNCP-large hparams)',
+                markersize=8, alpha=0.85)
+
+
 def _plot_refs(ax):
     if JAX_REF:
         xs, ys, _ = zip(*JAX_REF)
@@ -371,7 +393,8 @@ def _enwik8_detail(ax):
     add('mixer + Tier 1 LR pull-in', 1.2715, '#ff7f0e', 'x', False)
     add('mixer + ngram (t1_ng)', 1.2805, '#bcbd22', 'P', False)
     add('LSTM solo', 1.2918, '#1f77b4', 'o', True)
-    add('XL-large solo (NNCP-large hparams)', 1.3388, '#ff9896', 'D', True)
+    add('XL-large solo (bf16)', 1.3388, '#ff9896', 'D', True)
+    add('XL-large solo (fp16)', 1.3387, '#c49c94', 'd', True)
     add('Transformer-XL-base solo', 1.3734, '#d62728', 'D', True)
     pts.sort(key=lambda r: r[1])
     for i, (label, bpc, color, marker, fill, weight) in enumerate(pts):
@@ -416,6 +439,7 @@ def main():
     #     sweep). Single-point curve; same reason as above.
     _plot_hybrid_mixer_xl_large_full(ax_main)
     _plot_transformer_xl_large_solo(ax_main)
+    _plot_transformer_xl_large_solo_fp16(ax_main)
     _plot_refs(ax_main)
     _format_axis(ax_main, 'Compression rate vs file size — torch_compress')
     _enwik8_detail(ax_detail)
