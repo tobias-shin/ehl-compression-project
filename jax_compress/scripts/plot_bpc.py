@@ -252,6 +252,40 @@ HYBRID_MIXER_XL_LARGE_FULL_DATA = [
     (100_000_000, 1.2477, 'enwik8', 'bf16', 'nncp'),
 ]
 
+# Same hybrid + mixer + XL-large config but with the cuDNN-fused nn.LSTM
+# backend instead of the legacy nn.LSTMCell time loop. ~1.75x faster at
+# enwik5 (81s vs 142s in the dry-runs) with bpc matching within rounding.
+# Also --no-deterministic, which we verified is bit-identical to
+# deterministic on our hardware (24% wall speedup, zero bpc cost).
+#
+# enwik4-7 completed cleanly; bpc matches HYBRID_MIXER_XL_LARGE_FULL_DATA
+# within 0.0026 across all four scales -- confirming the cuDNN-LSTM
+# refactor is mathematically equivalent at small/mid scales.
+#
+# enwik8 hit a NaN crash at step 396,973 (81.74%): bf16 + cuDNN's fused
+# RNN kernel produced a NaN forward output during pure streaming (5K
+# steps after a successful retrain). Crash cause is probably an
+# overflow in the fused kernel's bf16 internal-state accumulation; the
+# cell-LSTM path avoids it because each timestep is a separate kernel
+# launch with implicit precision boundaries. Documented in the run's
+# notebook traceback.
+#
+# enwik9 was queued after enwik8 in the chain but killed before launch
+# (~34min in NNCP preprocess) once the enwik8 crash was diagnosed --
+# enwik9 would almost certainly hit the same NaN issue at scale.
+#
+# Fix path (in progress at this commit): selective autocast (bf16 XL +
+# fp32 LSTM) plus a NaN-safe forward wrapper. After that fix lands,
+# this series re-runs to backfill enwik8 + enwik9.
+HYBRID_MIXER_CUDNN_LSTM_DATA = [
+    (    10_000, 3.5032, 'enwik4', 'bf16', 'none'),
+    (   100_000, 2.5715, 'enwik5', 'bf16', 'nncp'),
+    ( 1_000_000, 1.9428, 'enwik6', 'bf16', 'nncp'),
+    (10_000_000, 1.5755, 'enwik7', 'bf16', 'nncp'),
+    # enwik8: NaN crash at step 396,973 (81.74%). No bpc recorded.
+    # enwik9: killed in preprocess to avoid same NaN risk.
+]
+
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_PATH = os.path.normpath(os.path.join(THIS_DIR, '..', 'data', 'bpc_vs_size.png'))
 
