@@ -1374,6 +1374,13 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
   denom = 0.0
   template = '{:0.2f}%\\tcross entropy: {:0.2f}\\ttime: {:0.2f}\\tlstm_lr: {:0.6f}\\txl_lr: {:0.6f}\\tstep: {}'
 
+  # NaN-safety counters. Used by the four NaN-detection checkpoints in the
+  # streaming loop below to track how many times each safety net fired. We
+  # cap printed-warning chatter at 5 per category but keep counting and
+  # log every event's step in _nan_event_steps for the post-run summary.
+  _nan_events = {'lstm': 0, 'xl': 0, 'probs': 0, 'loss': 0}
+  _nan_event_steps = []
+
   pos = 0
   current_lstm_lr = initial_lstm_lr
   current_xl_lr = initial_xl_lr
@@ -1428,16 +1435,50 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
         xl_mems = [t.to(ac_dtype) for t in xl_mems]
 
     # ---- Forward both submodels ----
-    # LSTM: pop the oldest state from queue, BPTT replay over seq_length
+    # LSTM: pop the oldest state from queue, BPTT replay over seq_length.
+    # Note: no autocast wrapping here -- the LSTM submodel runs in fp32 in
+    # the hybrid path (whereas the LSTM-solo path uses _lstm_autocast). Only
+    # the XL forward is in bf16 autocast below.
     lstm_state_in = lstm_states_queue.pop(0)
     lstm_logits, new_lstm_state = model.lstm(
         lstm_seq_input, lstm_state_in, return_sequence=False, deterministic=True)
+
+    # ---- NaN safety net (A): LSTM output ----
+    # If the LSTM produced a NaN forward output, reset its states to zeros
+    # and substitute zero logits for this step. Skips the LSTM optimizer step
+    # via a flag below so we don't propagate the bad gradient.
+    lstm_nan = torch.isnan(lstm_logits).any()
+    if lstm_nan:
+      _nan_events['lstm'] += 1
+      _nan_event_steps.append((pos, 'lstm'))
+      if _nan_events['lstm'] <= 5:
+        print(f"WARNING: LSTM NaN at step={pos}; resetting states + zero logits", flush=True)
+      lstm_logits = torch.zeros_like(lstm_logits)
+      new_lstm_state = fresh_lstm_states()
 
     # Transformer-XL: forward with current mems under autocast
     with torch.autocast(device_type=device.type, dtype=ac_dtype, enabled=use_bf16_flag):
       xl_logits, new_xl_mems = model.transformer_xl(
           xl_seq_input, xl_mems, return_sequence=False, deterministic=True)
     xl_logits = xl_logits.float()
+
+    # ---- NaN safety net (A): XL output + mems ----
+    # xl_mems carries forward state-to-state, so a single NaN in mems
+    # contaminates all subsequent forwards. Reset both if either has NaN.
+    xl_logits_nan = torch.isnan(xl_logits).any()
+    xl_mems_nan = (new_xl_mems is not None and
+                   any(torch.isnan(m).any() for m in new_xl_mems))
+    if xl_logits_nan or xl_mems_nan:
+      _nan_events['xl'] += 1
+      _nan_event_steps.append((pos, f'xl(logits={bool(xl_logits_nan)},mems={bool(xl_mems_nan)})'))
+      if _nan_events['xl'] <= 5:
+        print(f"WARNING: XL NaN at step={pos} "
+              f"(logits={bool(xl_logits_nan)}, mems={bool(xl_mems_nan)}); "
+              f"resetting mems + zero logits", flush=True)
+      xl_logits = torch.zeros_like(xl_logits)
+      new_xl_mems = model.transformer_xl.init_states(batch_size, device)
+      if new_xl_mems is not None and ac_dtype != torch.float32:
+        new_xl_mems = [t.to(ac_dtype) for t in new_xl_mems]
 
     # ---- Combine: equal-weight or learned-mixer geometric mean ----
     log_probs_lstm = F.log_softmax(lstm_logits, dim=-1)
@@ -1452,6 +1493,19 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
       # Equal-weight geometric mean (the original hybrid behaviour).
       combined_log_probs = 0.5 * (log_probs_lstm + log_probs_xl)
     probs = F.softmax(combined_log_probs, dim=-1).detach().cpu().numpy()
+
+    # ---- NaN safety net (A): final probs ----
+    # Last line of defense before the AC. If anything upstream slipped a NaN
+    # past, fall back to uniform so AC encodes the actual symbol at
+    # log2(vocab_size) bits and the run continues.
+    if np.isnan(probs).any():
+      _nan_events['probs'] += 1
+      _nan_event_steps.append((pos, 'probs'))
+      if _nan_events['probs'] <= 5:
+        print(f"WARNING: probs NaN at step={pos}; falling back to uniform "
+              f"(this step encoded at log2(vocab)={np.log2(vocab_size):.2f} bits/token)",
+              flush=True)
+      probs = np.ones_like(probs) / vocab_size
 
     # ---- Drive the AC: one symbol per parallel stream ----
     current_symbols = []
@@ -1488,19 +1542,34 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
       nll_per = -combined_log_probs.gather(1, symbols_t.unsqueeze(1)).squeeze(1)
       total_loss = total_loss + (nll_per * mask_t).sum()
 
-    total_loss.backward()
-    # Per-component clip budgets: LSTM keeps torch_compress's 4.0; the
-    # Transformer-XL half uses NNCP-aligned clip_xl (0.25); the mixer is
-    # tiny so a generous 4.0 is fine.
-    _clip_xl = float(globals().get('clip_xl', 0.25))
-    torch.nn.utils.clip_grad_norm_(model.lstm.parameters(), 4.0)
-    torch.nn.utils.clip_grad_norm_(model.transformer_xl.parameters(), _clip_xl)
-    if model.mixer is not None:
-      torch.nn.utils.clip_grad_norm_(model.mixer.parameters(), 4.0)
-    lstm_opt.step()
-    xl_opt.step()
-    if mixer_opt is not None:
-      mixer_opt.step()
+    # ---- NaN safety net (A): loss check before backward ----
+    # If the loss is NaN (e.g., from NaN slipping through despite the above
+    # checks), skip backward+step so we don't poison the weights.
+    if torch.isnan(total_loss):
+      _nan_events['loss'] += 1
+      _nan_event_steps.append((pos, 'loss'))
+      if _nan_events['loss'] <= 5:
+        print(f"WARNING: total_loss NaN at step={pos}; skipping backward + optimizer step",
+              flush=True)
+      # Still zero grads to clear any partial state
+      lstm_opt.zero_grad()
+      xl_opt.zero_grad()
+      if mixer_opt is not None:
+        mixer_opt.zero_grad()
+    else:
+      total_loss.backward()
+      # Per-component clip budgets: LSTM keeps torch_compress's 4.0; the
+      # Transformer-XL half uses NNCP-aligned clip_xl (0.25); the mixer is
+      # tiny so a generous 4.0 is fine.
+      _clip_xl = float(globals().get('clip_xl', 0.25))
+      torch.nn.utils.clip_grad_norm_(model.lstm.parameters(), 4.0)
+      torch.nn.utils.clip_grad_norm_(model.transformer_xl.parameters(), _clip_xl)
+      if model.mixer is not None:
+        torch.nn.utils.clip_grad_norm_(model.mixer.parameters(), 4.0)
+      lstm_opt.step()
+      xl_opt.step()
+      if mixer_opt is not None:
+        mixer_opt.step()
 
     # ---- Compute ensemble cross-entropy for logging (against AC's distribution) ----
     # Use the *same* combined_log_probs the AC saw (detached) so the running
@@ -1549,6 +1618,26 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
     ))
     tb_writer.flush()
     tb_writer.close()
+
+  # ---- NaN safety net (A): post-run summary ----
+  # Always print, even if no events fired -- gives at-a-glance confirmation
+  # that the safety nets were active and how many times they caught
+  # something. The first failing event's step is the most diagnostic info
+  # for understanding root cause.
+  total_nan_events = sum(_nan_events.values())
+  if total_nan_events == 0:
+    print("\\nNaN safety nets: 0 events triggered (clean run).")
+  else:
+    print(f"\\nNaN safety nets: {total_nan_events} events triggered")
+    for kind, count in _nan_events.items():
+      if count > 0:
+        first = next((s for (s, k) in _nan_event_steps if k.startswith(kind)), None)
+        print(f"  {kind}: {count} events; first at step={first}")
+    # Show up to 10 events for diagnostic detail
+    print(f"  first {min(10, len(_nan_event_steps))} events: {_nan_event_steps[:10]}")
+    if tb_writer is not None:
+      tb_writer.add_text('nan_summary',
+                         f"total={total_nan_events} by_kind={_nan_events}")
 
 
 def _retrain_hybrid(*, model, lstm_retrain_opt, xl_retrain_opt, lstm_lr, xl_lr,
