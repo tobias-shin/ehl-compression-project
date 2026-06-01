@@ -128,32 +128,64 @@ class LSTMModel(nn.Module):
   Mirrors the Flax model: each layer (after the first) sees concat(embedding, prev_output);
   the dense head sees concat of all layers' outputs.
 
-  Implementation note: uses nn.LSTMCell in a manual time loop instead of nn.LSTM.
-  cuDNN's RNN kernel is non-deterministic even with cudnn.deterministic=True, which
-  would break the LTCB compress/decompress invariant. The cell-loop is slower but
-  produces bit-identical predictions across runs on the same machine.
+  Two interchangeable backends, selected at construction time via ``use_cudnn_lstm``:
+
+    use_cudnn_lstm=True (default): each layer is a single-layer ``nn.LSTM``.
+      cuDNN's fused RNN kernel processes the seq_length time dim internally in
+      one call. ~10-15x faster on bf16 GH200 than the cell-loop. PyTorch docs
+      say cuDNN RNN backward is non-deterministic due to atomic adds in
+      gradient accumulation; empirically (scripts/test_cudnn_lstm_determinism.py)
+      it's bit-deterministic on our hardware (forward + backward + cross-process,
+      all six checks pass with max |diff|=0). Recommended for R&D and within-
+      machine encode/decode. Pair with use_deterministic=False (torch's
+      strict-deterministic mode disables some cuDNN kernels).
+
+    use_cudnn_lstm=False: ``nn.LSTMCell`` in a manual time loop. Slower (one
+      Python frame + kernel launch per timestep per layer) but is the original
+      reference path. Pair with use_deterministic=True for LTCB-style
+      cross-machine bit-exact decode.
+
+  Both backends preserve the architecture (per-layer embedding skip,
+  multi-layer output concat); they should produce mathematically identical
+  results but are not bit-equal across backends because cuDNN's internal
+  reduction order differs from the cell-loop. Final bpc should match within
+  rounding (verified on the smoke tests).
   """
 
-  def __init__(self, vocab_size, embedding_size, rnn_units, num_layers, dropout_rate=0.0):
+  def __init__(self, vocab_size, embedding_size, rnn_units, num_layers,
+               dropout_rate=0.0, use_cudnn_lstm=True):
     super().__init__()
     self.vocab_size = vocab_size
     self.embedding_size = embedding_size
     self.rnn_units = rnn_units
     self.num_layers = num_layers
     self.dropout_rate = dropout_rate
+    self.use_cudnn_lstm = use_cudnn_lstm
 
     self.embed = nn.Embedding(vocab_size, embedding_size)
 
-    self.lstm_cells = nn.ModuleList()
-    for i in range(num_layers):
-      input_size = embedding_size if i == 0 else embedding_size + rnn_units
-      self.lstm_cells.append(nn.LSTMCell(input_size, rnn_units))
+    if use_cudnn_lstm:
+      self.lstm_layers = nn.ModuleList()
+      for i in range(num_layers):
+        input_size = embedding_size if i == 0 else embedding_size + rnn_units
+        self.lstm_layers.append(nn.LSTM(input_size, rnn_units,
+                                        num_layers=1, batch_first=True))
+    else:
+      self.lstm_cells = nn.ModuleList()
+      for i in range(num_layers):
+        input_size = embedding_size if i == 0 else embedding_size + rnn_units
+        self.lstm_cells.append(nn.LSTMCell(input_size, rnn_units))
 
     out_size = rnn_units * num_layers if num_layers > 1 else rnn_units
     self.dense_logits = nn.Linear(out_size, vocab_size)
 
   def init_states(self, batch_size, device):
-    """Returns a list of (h, c) tuples (one per layer), each (batch, rnn_units)."""
+    """Returns a list of (h, c) tuples (one per layer), each (batch, rnn_units).
+
+    State shape is backend-independent: callers don't care whether the
+    underlying module is nn.LSTM or nn.LSTMCell. The forward method bridges
+    by squeezing/unsqueezing the layer dim that nn.LSTM expects.
+    """
     return [
         (torch.zeros(batch_size, self.rnn_units, device=device),
          torch.zeros(batch_size, self.rnn_units, device=device))
@@ -173,27 +205,41 @@ class LSTMModel(nn.Module):
     """
     use_dropout = not deterministic
     embedding = F.dropout(self.embed(inputs), p=self.dropout_rate, training=use_dropout)
-    seq_len = embedding.shape[1]
 
     new_states = list(states)
     layer_outputs = []
     curr_input = embedding
 
-    for i, cell in enumerate(self.lstm_cells):
-      h, c = states[i]
-      step_outputs = []
-      for t in range(seq_len):
-        h, c = cell(curr_input[:, t, :], (h, c))
-        step_outputs.append(h)
-      layer_out = torch.stack(step_outputs, dim=1)  # (batch, seq, rnn_units)
-      new_states[i] = (h, c)
-
-      if i < self.num_layers - 1:
-        layer_out = F.dropout(layer_out, p=self.dropout_rate, training=use_dropout)
-      layer_outputs.append(layer_out)
-
-      if i < self.num_layers - 1:
-        curr_input = torch.cat([embedding, layer_out], dim=-1)
+    if self.use_cudnn_lstm:
+      # cuDNN path: one nn.LSTM call per layer, time dim handled internally.
+      for i, lstm_layer in enumerate(self.lstm_layers):
+        h, c = states[i]
+        # nn.LSTM expects (num_layers=1, batch, hidden) for (h0, c0).
+        layer_out, (h_out, c_out) = lstm_layer(
+            curr_input, (h.unsqueeze(0), c.unsqueeze(0)))
+        # Strip the num_layers=1 dim from the returned states.
+        new_states[i] = (h_out.squeeze(0), c_out.squeeze(0))
+        if i < self.num_layers - 1:
+          layer_out = F.dropout(layer_out, p=self.dropout_rate, training=use_dropout)
+        layer_outputs.append(layer_out)
+        if i < self.num_layers - 1:
+          curr_input = torch.cat([embedding, layer_out], dim=-1)
+    else:
+      # Cell-loop path: Python loop over timesteps within each layer.
+      seq_len = embedding.shape[1]
+      for i, cell in enumerate(self.lstm_cells):
+        h, c = states[i]
+        step_outputs = []
+        for t in range(seq_len):
+          h, c = cell(curr_input[:, t, :], (h, c))
+          step_outputs.append(h)
+        layer_out = torch.stack(step_outputs, dim=1)  # (batch, seq, rnn_units)
+        new_states[i] = (h, c)
+        if i < self.num_layers - 1:
+          layer_out = F.dropout(layer_out, p=self.dropout_rate, training=use_dropout)
+        layer_outputs.append(layer_out)
+        if i < self.num_layers - 1:
+          curr_input = torch.cat([embedding, layer_out], dim=-1)
 
     if return_sequence:
       final_rep = layer_outputs[0] if self.num_layers == 1 else torch.cat(layer_outputs, dim=-1)
@@ -226,7 +272,8 @@ def build_model(model_type, *, vocab_size, embedding_size, rnn_units, num_layers
   if model_type == "lstm":
     return LSTMModel(vocab_size=vocab_size, embedding_size=embedding_size,
                      rnn_units=rnn_units, num_layers=num_layers,
-                     dropout_rate=dropout_rate)
+                     dropout_rate=dropout_rate,
+                     use_cudnn_lstm=globals().get('use_cudnn_lstm', True))
   if model_type == "transformer_xl":
     from models.transformer_xl import TransformerXLModel
     g = globals()
@@ -253,7 +300,8 @@ def build_model(model_type, *, vocab_size, embedding_size, rnn_units, num_layers
     # the hybrid is purely composition.
     lstm = LSTMModel(vocab_size=vocab_size, embedding_size=embedding_size,
                      rnn_units=rnn_units, num_layers=num_layers,
-                     dropout_rate=dropout_rate)
+                     dropout_rate=dropout_rate,
+                     use_cudnn_lstm=globals().get('use_cudnn_lstm', True))
     from models.transformer_xl import TransformerXLModel
     g = globals()
     xl = TransformerXLModel(
@@ -1630,6 +1678,10 @@ use_fp16 = False #@param {type:"boolean"}
 #@markdown ---
 use_deterministic = True #@param {type:"boolean"}
 #@markdown _Force the deterministic cuBLAS / cuDNN paths needed for bit-identical encode/decode in the arithmetic coder (LTCB-style determinism). NNCP doesn't constrain this and may use faster non-deterministic kernels with different numerics; set to False to test against that regime. When False, decompression on a different machine may not be bit-exact even with identical hparams. Round-trip on the SAME machine is usually fine because both encode and decode use the same kernels in sequence._
+
+#@markdown ---
+use_cudnn_lstm = True #@param {type:"boolean"}
+#@markdown _LSTM submodel backend. True (default) uses one `nn.LSTM` call per layer; cuDNN's fused RNN processes the seq_length time dim internally in one kernel. ~10-15x faster on bf16 GH200 than the legacy `nn.LSTMCell` Python time-loop. Empirically bit-deterministic on our hardware (see `scripts/test_cudnn_lstm_determinism.py`) despite PyTorch's documentation warning that cuDNN RNN backward uses atomic gradient accumulation. Pair with `use_deterministic=False` to avoid PyTorch disabling the cuDNN kernels. Set to False to use the legacy `nn.LSTMCell` reference path (matches behaviour before commit X). Both paths preserve the same architecture (per-layer embedding skip, multi-layer output concat) and should give matching bpc within rounding._
 
 #@markdown ---
 model_type = "lstm" #@param ["lstm", "transformer_xl"]

@@ -76,6 +76,15 @@ def main():
                          "the AC may not be bit-exact across machines. NNCP "
                          "runs this way; use it to compare against NNCP.")
     ap.set_defaults(use_deterministic=True)
+    ap.add_argument("--use-cudnn-lstm", dest="use_cudnn_lstm",
+                    action="store_true",
+                    help="LSTM submodel uses nn.LSTM (cuDNN fused RNN) "
+                         "[default]. ~10-15x faster than nn.LSTMCell.")
+    ap.add_argument("--no-cudnn-lstm", dest="use_cudnn_lstm",
+                    action="store_false",
+                    help="LSTM submodel uses the legacy nn.LSTMCell Python "
+                         "time-loop. Slower but the original reference path.")
+    ap.set_defaults(use_cudnn_lstm=True)
     ap.add_argument("--preprocess", default="nncp", choices=["nncp", "none"])
     ap.add_argument("--tb-run-name", required=True)
     ap.add_argument("--tb-logdir", default="data/tensorboard")
@@ -178,6 +187,7 @@ def main():
         "use_bf16": args.use_bf16,
         "use_fp16": args.use_fp16,
         "use_deterministic": args.use_deterministic,
+        "use_cudnn_lstm": args.use_cudnn_lstm,
         "mode": args.mode,
         "tensorboard": True,
         "tensorboard_run_name": args.tb_run_name,
