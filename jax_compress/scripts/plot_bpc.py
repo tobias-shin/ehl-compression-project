@@ -194,6 +194,12 @@ TRANSFORMER_XL_LARGE_SOLO_DATA = [
     ( 1_000_000, 2.3516, 'enwik6', 'bf16', 'nncp'),
     (10_000_000, 1.7630, 'enwik7', 'bf16', 'nncp'),
     (100_000_000, 1.3388, 'enwik8', 'bf16', 'nncp'),
+    # enwik9: 50h 55min wall, --use-bf16 --no-deterministic --n-words 16384
+    # --min-freq 512 (matches nncp_enwik_large.sh enwik9 preprocess).
+    # 0.9877 bpc vs nncp v2.1 0.8978 = +0.0899 gap (similar to the +0.137
+    # at enwik8 but narrower in relative terms: 10.0% vs 11.4%). The
+    # implementation-fidelity gap closes with scale.
+    (1_000_000_000, 0.9877, 'enwik9', 'bf16', 'nncp'),
 ]
 
 # Same XL-large solo config but with --no-deterministic. Tests whether
