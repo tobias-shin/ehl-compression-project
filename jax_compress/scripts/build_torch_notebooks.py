@@ -1919,6 +1919,28 @@ download_src = download_src.replace(
 )
 nb['cells'][15] = code_cell(download_src)
 
+# Patch the Decompression cell (cell 17) to read the compressed bytes from
+# the canonical location 'data/compressed.dat' instead of path_to_file. In
+# mode='both', the Compression cell already renames path_to_file to
+# 'data/compressed.dat' as a side effect, so the original code happened to
+# work. In mode='decompress' alone, Compression is skipped and path_to_file
+# remains the user-supplied original file -- whose first 5 bytes get
+# misread as the length header (e.g. enwik8 starts with '<medi', which
+# big-endian decodes to ~260 billion, causing a MemoryError on the
+# subsequent `output = [0] * length` allocation).
+decompress_src = ''.join(nb['cells'][17]['source'])
+decompress_src = decompress_src.replace(
+    '  # Open the binary input path to interpret compressed sequence arrays\n'
+    '  with open(path_to_file, "rb") as inp:\n',
+    '  # Open the canonical compressed-bytes location. The Compression cell\n'
+    '  # always writes to data/compressed.dat; reading from there directly\n'
+    '  # means mode=decompress works regardless of what path_to_file points\n'
+    '  # at (in mode=both, path_to_file already gets renamed to compressed.dat\n'
+    '  # by Compression, so this is a no-op for that flow).\n'
+    '  with open("data/compressed.dat", "rb") as inp:\n',
+)
+nb['cells'][17] = code_cell(decompress_src)
+
 # Validate cell indices: ensure no remaining 'jax' / 'flax' / 'optax' references
 import re
 JAX_PATTERN = re.compile(r"\b(jax|jnp|flax|optax)\b")
