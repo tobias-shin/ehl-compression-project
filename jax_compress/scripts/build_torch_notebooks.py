@@ -88,6 +88,7 @@ import math
 import sys
 import subprocess
 import contextlib
+import copy
 from typing import Any, List, Tuple
 try:
   from google.colab import drive
@@ -496,10 +497,44 @@ def backward_and_step(logits_list, optimizers, models, symbols, mask, vocab_size
   return (loss_vals * mask).sum().item(), mask.sum().item()
 
 
+# Module-level counter incremented inside retrain_step whenever a NaN-revert
+# fires. Read + reset by _process_hybrid before/after each run. Wrapped in a
+# single-element list so functions can mutate it without ``global`` decls.
+_RETRAIN_NAN_REVERT_COUNT = [0]
+_RETRAIN_NAN_REVERT_STEPS = []  # list of (call_index, model_index) tuples
+
+
 def retrain_step(models, retrain_optimizers, inputs, targets, current_lr):
-  """Runs a single retraining step (forward + backward) over a full sequence with dropout."""
+  """Runs a single retraining step (forward + backward) over a full sequence with dropout.
+
+  NaN-safe: snapshots each model's state_dict AND its optimizer state before
+  the forward+backward+step. After ``optimizer.step()``, scans the updated
+  parameters for NaN; if found, restores both the model weights and the
+  optimizer state to their pre-step values. The streaming loop in the
+  caller then sees fp32-clean weights and continues normally; the retrain
+  becomes a no-op for that batch.
+
+  Why this matters: the bf16 cuDNN LSTM fused kernel (active inside
+  ``_lstm_autocast``) can produce NaN forward outputs at scale (observed
+  starting at ~step 397K on enwik8 hybrid + cuDNN-LSTM). The NaN flows
+  through backward into gradients, then through Adam's optimizer step into
+  the parameters themselves. Without this revert, the weights stay
+  permanently NaN; every subsequent forward produces NaN, even though the
+  streaming-side forward is in fp32 (the NaN is in the weights, not the
+  precision). The revert keeps the model weights fp32-clean even when
+  individual retrain steps blow up.
+
+  Reverting the optimizer state matters too: Adam's exp_avg / exp_avg_sq
+  carry forward across steps. If they become NaN, the NEXT retrain step
+  immediately produces NaN updates even with clean weights. Restoring
+  both keeps the cycle from becoming permanent.
+  """
   losses = []
-  for model, optimizer in zip(models, retrain_optimizers):
+  for model_idx, (model, optimizer) in enumerate(zip(models, retrain_optimizers)):
+    # ---- Snapshots for NaN-revert ----
+    model_snapshot = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    opt_snapshot = copy.deepcopy(optimizer.state_dict())
+
     optimizer.zero_grad()
     init_states = model.init_states(inputs.shape[0], inputs.device)
     # deterministic=False enables dropout (matches Flax deterministic=False path)
@@ -517,6 +552,18 @@ def retrain_step(models, retrain_optimizers, inputs, targets, current_lr):
     for g in optimizer.param_groups:
       g['lr'] = current_lr
     optimizer.step()
+
+    # ---- NaN-revert check ----
+    if any(torch.isnan(p.data).any() for p in model.parameters()):
+      model.load_state_dict(model_snapshot)
+      optimizer.load_state_dict(opt_snapshot)
+      _RETRAIN_NAN_REVERT_COUNT[0] += 1
+      _RETRAIN_NAN_REVERT_STEPS.append((len(_RETRAIN_NAN_REVERT_STEPS), model_idx))
+      if _RETRAIN_NAN_REVERT_COUNT[0] <= 5:
+        print(f"WARNING: retrain step produced NaN parameters (model_idx={model_idx}); "
+              f"reverted to pre-step state. Total reverts so far: "
+              f"{_RETRAIN_NAN_REVERT_COUNT[0]}.", flush=True)
+
     losses.append(loss.item())
   return float(np.mean(losses))
 
@@ -1380,6 +1427,10 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
   # log every event's step in _nan_event_steps for the post-run summary.
   _nan_events = {'lstm': 0, 'xl': 0, 'probs': 0, 'loss': 0}
   _nan_event_steps = []
+  # Reset the module-level retrain-revert counter so the summary covers
+  # this run only. retrain_step() reads/writes _RETRAIN_NAN_REVERT_COUNT[0].
+  _RETRAIN_NAN_REVERT_COUNT[0] = 0
+  _RETRAIN_NAN_REVERT_STEPS.clear()
 
   pos = 0
   current_lstm_lr = initial_lstm_lr
@@ -1625,19 +1676,23 @@ def _process_hybrid(compress, length, vocab_size, coder, data):
   # something. The first failing event's step is the most diagnostic info
   # for understanding root cause.
   total_nan_events = sum(_nan_events.values())
-  if total_nan_events == 0:
+  retrain_reverts = _RETRAIN_NAN_REVERT_COUNT[0]
+  if total_nan_events == 0 and retrain_reverts == 0:
     print("\\nNaN safety nets: 0 events triggered (clean run).")
   else:
-    print(f"\\nNaN safety nets: {total_nan_events} events triggered")
+    print(f"\\nNaN safety nets: {total_nan_events} streaming events + "
+          f"{retrain_reverts} retrain reverts")
     for kind, count in _nan_events.items():
       if count > 0:
         first = next((s for (s, k) in _nan_event_steps if k.startswith(kind)), None)
         print(f"  {kind}: {count} events; first at step={first}")
-    # Show up to 10 events for diagnostic detail
-    print(f"  first {min(10, len(_nan_event_steps))} events: {_nan_event_steps[:10]}")
+    if retrain_reverts > 0:
+      print(f"  retrain reverts: {retrain_reverts} (pre-step weights restored)")
+    print(f"  first {min(10, len(_nan_event_steps))} streaming events: {_nan_event_steps[:10]}")
     if tb_writer is not None:
       tb_writer.add_text('nan_summary',
-                         f"total={total_nan_events} by_kind={_nan_events}")
+                         f"streaming_total={total_nan_events} by_kind={_nan_events} "
+                         f"retrain_reverts={retrain_reverts}")
 
 
 def _retrain_hybrid(*, model, lstm_retrain_opt, xl_retrain_opt, lstm_lr, xl_lr,
