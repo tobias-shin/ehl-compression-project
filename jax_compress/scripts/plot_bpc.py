@@ -252,38 +252,45 @@ HYBRID_MIXER_XL_LARGE_FULL_DATA = [
     (100_000_000, 1.2477, 'enwik8', 'bf16', 'nncp'),
 ]
 
-# Same hybrid + mixer + XL-large config but with the cuDNN-fused nn.LSTM
-# backend instead of the legacy nn.LSTMCell time loop. ~1.75x faster at
-# enwik5 (81s vs 142s in the dry-runs) with bpc matching within rounding.
-# Also --no-deterministic, which we verified is bit-identical to
-# deterministic on our hardware (24% wall speedup, zero bpc cost).
+# Hybrid + mixer + XL-large with the cuDNN-fused nn.LSTM backend instead
+# of the legacy nn.LSTMCell time loop. ~1.75x faster at enwik5 (81s vs
+# 142s in the dry-runs) with bpc matching within rounding. Also
+# --no-deterministic (verified bit-identical to deterministic on our
+# hardware, 24% wall speedup, zero bpc cost).
 #
-# enwik4-7 completed cleanly; bpc matches HYBRID_MIXER_XL_LARGE_FULL_DATA
-# within 0.0026 across all four scales -- confirming the cuDNN-LSTM
-# refactor is mathematically equivalent at small/mid scales.
+# History at enwik8 / enwik9 scale:
+#   - First attempt (commit e1e44d0 backend only): crashed at step
+#     396,973 with NaN logits cascading through the AC.
+#   - Second attempt (b7a6a7b: 4 streaming safety nets): no crash, but
+#     bpc degraded to 1.2647 because the LSTM weights became permanently
+#     NaN at step 397,001 (retrain corruption) and the streaming-side
+#     nets reset states each step without fixing weights, so the LSTM
+#     contributed zero useful signal for the last 18% of the file.
+#     88,666 streaming NaN events fired.
+#   - Third attempt (320eca7: retrain weight+optimizer revert): 1.2472
+#     bpc, 35 retrain reverts (catching the bf16 cuDNN NaN at the
+#     source), 0 streaming events. ROUND-TRIP VERIFIED via mode=both
+#     end-to-end: encode + decode produced bit-identical md5 against
+#     original enwik8.
 #
-# enwik8 hit a NaN crash at step 396,973 (81.74%): bf16 + cuDNN's fused
-# RNN kernel produced a NaN forward output during pure streaming (5K
-# steps after a successful retrain). Crash cause is probably an
-# overflow in the fused kernel's bf16 internal-state accumulation; the
-# cell-LSTM path avoids it because each timestep is a separate kernel
-# launch with implicit precision boundaries. Documented in the run's
-# notebook traceback.
+# The 1.2472 is the first round-trip-verified enwik8 result this codebase
+# has produced -- all prior enwik8 numbers were mode=compress only.
+# Matches HYBRID_MIXER_XL_LARGE_FULL_DATA's 1.2477 within rounding
+# (Δ -0.0005), confirming the cuDNN-LSTM backend is mathematically
+# equivalent at scale once bf16 retrain instability is contained.
 #
-# enwik9 was queued after enwik8 in the chain but killed before launch
-# (~34min in NNCP preprocess) once the enwik8 crash was diagnosed --
-# enwik9 would almost certainly hit the same NaN issue at scale.
-#
-# Fix path (in progress at this commit): selective autocast (bf16 XL +
-# fp32 LSTM) plus a NaN-safe forward wrapper. After that fix lands,
-# this series re-runs to backfill enwik8 + enwik9.
+# enwik9 not yet rerun on this code (the v3 run only did enwik8).
 HYBRID_MIXER_CUDNN_LSTM_DATA = [
     (    10_000, 3.5032, 'enwik4', 'bf16', 'none'),
     (   100_000, 2.5715, 'enwik5', 'bf16', 'nncp'),
     ( 1_000_000, 1.9428, 'enwik6', 'bf16', 'nncp'),
     (10_000_000, 1.5755, 'enwik7', 'bf16', 'nncp'),
-    # enwik8: NaN crash at step 396,973 (81.74%). No bpc recorded.
-    # enwik9: killed in preprocess to avoid same NaN risk.
+    # enwik8: round-trip-verified (md5(data/final.dat) == md5(data/enwik8))
+    # after compress (~14h) + decompress (~14h) on lambda-1 GH200.
+    # 35 retrain reverts caught the bf16 cuDNN NaN at source; 0 streaming
+    # events. 15,589,479 compressed bytes; preprocessed bytes / vocab
+    # 4096 / min_freq 64.
+    (100_000_000, 1.2472, 'enwik8', 'bf16', 'nncp'),
 ]
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -447,6 +454,7 @@ def _enwik8_detail(ax):
         pts.append((label, bpc, color, marker, fill, weight))
     add('nncp v2.1', 1.2017, '#9467bd', 'v', True, 'bold')
     add('jax-compress (Knoll)', 1.2404, '#2ca02c', '^', True, 'bold')
+    add('hybrid + cuDNN-LSTM (round-trip verified)', 1.2472, '#17becf', 'h', True, 'bold')
     add('hybrid + mixer + full NNCP-large', 1.2477, '#9edae5', 'p', True, 'bold')
     add('hybrid + mixer + XL-large', 1.2488, '#17becf', 'h', True, 'bold')
     add('hybrid + mixer + retrain-block 10M', 1.2587, '#e377c2', 's', True)
