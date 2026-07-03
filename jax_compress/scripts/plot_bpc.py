@@ -80,6 +80,18 @@ NNCP_REF = [
     (1_000_000_000, 0.8978, 'nncp v2.1 enwik9'),
 ]
 
+# NNCP v3.2 -- current LTCB leader as of the screenshot shared 2026-07-03.
+# Substantially improves on v2.1 at both scales.
+#   enwik8: 14,915,298 bytes -> 1.1932 bpc
+#   enwik9: 106,632,363 bytes -> 0.8531 bpc
+# Vendored source we ported from is still v2.1 (in jax_compress/nncp/), so
+# v2.1 remains the closer architectural comparison; v3.2 is the "where's
+# the current SOTA on this benchmark" reference.
+NNCP_V3_2_REF = [
+    (100_000_000, 1.1932, 'nncp v3.2 enwik8'),
+    (1_000_000_000, 0.8531, 'nncp v3.2 enwik9'),
+]
+
 # Hybrid backend (model_type=hybrid -- LSTM + Transformer-XL geometric-mean
 # ensemble; both submodels train independently per step, AC sees the combined
 # distribution). Filled in as runs complete.
@@ -291,6 +303,17 @@ HYBRID_MIXER_CUDNN_LSTM_DATA = [
     # events. 15,589,479 compressed bytes; preprocessed bytes / vocab
     # 4096 / min_freq 64.
     (100_000_000, 1.2472, 'enwik8', 'bf16', 'nncp'),
+    # enwik9: round-trip-verified. Compress + decompress + md5 chain in
+    # tmux enwik9_v3 (2026-06-04 to 2026-07-03). Compress wall 14.8 days
+    # (1,279,718s); decompress ~7 days; verify_roundtrip.sh confirmed
+    # bit-identical md5. 353,338 retrain reverts (retrain NaN production
+    # in bf16 cuDNN saturated at LTCB scale, but all caught cleanly); 0
+    # streaming events; determinism preserved across encode/decode
+    # despite 353K safety interventions. Compressed 109,630,833 bytes.
+    # First round-trip-verified enwik9 result in this codebase; beats
+    # jax-compress (0.9078) and nncp v2.1 (0.8978); loses to nncp v3.2
+    # (0.8531).
+    (1_000_000_000, 0.8770, 'enwik9', 'bf16', 'nncp'),
 ]
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -390,6 +413,26 @@ def _plot_hybrid_mixer_xl_large_full(ax):
                         fontsize=9, color='#17becf')
 
 
+def _plot_hybrid_mixer_cudnn_lstm(ax):
+    """Same architecture as xl_large_full, but with cuDNN-fused nn.LSTM
+    backend + retrain weight/optimizer NaN-revert. This is the curve that
+    extends to enwik9 -- first round-trip-verified LTCB-scale result in the
+    codebase."""
+    pts = _dedup_pts(HYBRID_MIXER_CUDNN_LSTM_DATA)
+    if pts:
+        xs, ys, _ = zip(*pts)
+        ax.plot(xs, ys, 'H-', color='#17becf',
+                label='torch hybrid + cuDNN-LSTM + NaN-safe retrain (round-trip verified)',
+                markersize=10, markerfacecolor='#17becf')
+        # Only annotate enwik9 (the new point that isn't already on
+        # xl_large_full's curve); the enwik4-8 points overlap visually with
+        # xl_large_full and adding more annotations would just clutter.
+        for x, y, l in pts:
+            if l == 'enwik9':
+                ax.annotate(l, (x, y), textcoords='offset points',
+                            xytext=(8, 6), fontsize=9, color='#17becf')
+
+
 def _plot_transformer_xl_large_solo(ax):
     pts = _dedup_pts(TRANSFORMER_XL_LARGE_SOLO_DATA)
     if pts:
@@ -423,6 +466,14 @@ def _plot_refs(ax):
         for x, y, l in NNCP_REF:
             ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, -14),
                         fontsize=9, color='#9467bd')
+    if NNCP_V3_2_REF:
+        xs, ys, _ = zip(*NNCP_V3_2_REF)
+        ax.plot(xs, ys, 'v-.', color='#6a3d9a',
+                label='nncp v3.2 (LTCB current top)',
+                markersize=8, alpha=0.7)
+        for x, y, l in NNCP_V3_2_REF:
+            ax.annotate(l, (x, y), textcoords='offset points', xytext=(8, 4),
+                        fontsize=9, color='#6a3d9a')
 
 
 def _format_axis(ax, title):
@@ -508,6 +559,7 @@ def main():
     #     n_words=8192 "option b" intermediate before the full NNCP-large
     #     sweep). Single-point curve; same reason as above.
     _plot_hybrid_mixer_xl_large_full(ax_main)
+    _plot_hybrid_mixer_cudnn_lstm(ax_main)
     _plot_transformer_xl_large_solo(ax_main)
     _plot_transformer_xl_large_solo_fp16(ax_main)
     _plot_refs(ax_main)
