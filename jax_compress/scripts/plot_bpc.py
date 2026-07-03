@@ -543,10 +543,50 @@ def _enwik8_detail(ax):
                 style='italic')
 
 
+def _enwik9_detail(ax):
+    """enwik9 detail panel: LTCB-canonical scale head-to-head. Only four
+    points because enwik9 is expensive (~22 days per round-trip run) and
+    we've only measured our best config -- no ablations at this scale."""
+    pts = []
+    def add(label, bpc, color, marker, fill=True, weight='normal'):
+        pts.append((label, bpc, color, marker, fill, weight))
+    add('nncp v3.2 (LTCB current top)', 0.8531, '#6a3d9a', 'v', True, 'bold')
+    add('hybrid + cuDNN-LSTM (round-trip verified)', 0.8770, '#17becf', 'H', True, 'bold')
+    add('nncp v2.1 (LTCB, vendored ref)', 0.8978, '#9467bd', 'v', True, 'bold')
+    add('jax-compress (Knoll)', 0.9078, '#2ca02c', '^', True, 'bold')
+    pts.sort(key=lambda r: r[1])
+    for i, (label, bpc, color, marker, fill, weight) in enumerate(pts):
+        y = len(pts) - 1 - i
+        ms_kwargs = dict(markersize=11) if fill else dict(markersize=12,
+                                                          markerfacecolor='white',
+                                                          markeredgewidth=2)
+        ax.plot([bpc], [y], marker=marker, color=color, linestyle='', **ms_kwargs)
+        ax.annotate(f'{label}', (bpc, y), textcoords='offset points',
+                    xytext=(12, 0), fontsize=9, va='center', color=color,
+                    fontweight=weight)
+        ax.annotate(f'{bpc:.4f}', (bpc, y), textcoords='offset points',
+                    xytext=(-8, 0), fontsize=8, va='center', ha='right',
+                    color='dimgray')
+    # Reference span: current LTCB top (nncp v3.2 = 0.8531) -> our best
+    # (0.8770). The gap this shades is where we could plausibly get with
+    # a better retrain path (see commit 68b936b for the retrain-revert
+    # discussion).
+    ax.axvspan(0.8531, 0.8770, alpha=0.08, color='gray')
+    ax.set_xlabel('bpc (lower is better)')
+    ax.set_yticks([])
+    ax.set_xlim(0.84, 0.94)
+    ax.set_ylim(-0.7, len(pts) - 0.3)
+    ax.set_title('enwik9 detail (linear bpc, LTCB-canonical scale)')
+    ax.grid(True, axis='x', alpha=0.3)
+    ax.annotate('round-trip verified: md5(final.dat) == md5(enwik9)',
+                xy=(0.02, 0.02), xycoords='axes fraction', fontsize=7,
+                color='gray', style='italic')
+
+
 def main():
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6),
-                             gridspec_kw={'width_ratios': [1.4, 1]})
-    ax_main, ax_detail = axes
+    fig, axes = plt.subplots(1, 3, figsize=(21, 6),
+                             gridspec_kw={'width_ratios': [1.7, 1.1, 1.0]})
+    ax_main, ax_detail, ax_enwik9 = axes
     _plot_lstm(ax_main)
     _plot_transformer_xl(ax_main)
     _plot_hybrid(ax_main)
@@ -565,6 +605,7 @@ def main():
     _plot_refs(ax_main)
     _format_axis(ax_main, 'Compression rate vs file size — torch_compress')
     _enwik8_detail(ax_detail)
+    _enwik9_detail(ax_enwik9)
     fig.tight_layout()
     fig.savefig(OUT_PATH, dpi=140)
     print(f'wrote {OUT_PATH}')
